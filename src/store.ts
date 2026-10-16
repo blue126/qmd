@@ -22,6 +22,7 @@ import {
   abandonEmbeddingBuild,
   beginEmbeddingBuild,
   completeEmbeddingBuild,
+  endpointFreeIdentityMaterial,
   createEmbeddingIdentity,
   EmbeddingIdentityStateError,
   ensureEmbeddingIdentitySchema,
@@ -5962,6 +5963,15 @@ function annVecScan(
   `).all(new Float32Array(embedding), vecK) as { hash_seq: string; distance: number }[];
 }
 
+function queryProviderIdentityMaterial(provider: EmbeddingProvider): string {
+  return provider.canonicalQueryIdentityMaterial?.() ?? provider.canonicalIdentityMaterial();
+}
+
+/**
+ * Query compatibility ignores endpoint routing. A base URL change must keep the
+ * published vector space searchable and must not mint or persist a new identity.
+ * Model, dimension, format, and chunking still have to match the current provider.
+ */
 function resolveReadyProviderEmbeddingIdentity(
   db: Database,
   provider: EmbeddingProvider,
@@ -5971,12 +5981,17 @@ function resolveReadyProviderEmbeddingIdentity(
       || storedIdentity.model !== provider.model || storedIdentity.remote !== provider.remote) {
     return undefined;
   }
+  if (provider.dimension !== null && provider.dimension !== storedIdentity.dimension) {
+    return undefined;
+  }
   let expectedIdentity: EmbeddingIdentity;
   try {
-    const providerCanonicalMaterial = provider.canonicalIdentityMaterialForDimension
-      ? provider.canonicalIdentityMaterialForDimension(storedIdentity.dimension)
-      : provider.canonicalIdentityMaterial();
-    if (storedProviderIdentity(storedIdentity.canonicalMaterial) !== providerCanonicalMaterial) {
+    const providerCanonicalMaterial = endpointFreeIdentityMaterial(queryProviderIdentityMaterial(provider));
+    const storedProviderMaterial = storedProviderIdentity(storedIdentity.canonicalMaterial);
+    const storedCanonicalMaterial = storedProviderMaterial
+      ? endpointFreeIdentityMaterial(storedProviderMaterial)
+      : undefined;
+    if (!providerCanonicalMaterial || storedCanonicalMaterial !== providerCanonicalMaterial) {
       return undefined;
     }
     expectedIdentity = createEmbeddingIdentity({
