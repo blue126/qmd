@@ -57,15 +57,6 @@ describe("package grammar distribution", () => {
     expect(qmdSkill).toContain("## MCP Tool: `query`");
     expect(qmdSkill).not.toContain("This file is a discovery stub");
 
-    const firstSixtyLines = qmdSkill.split(/\r?\n/).slice(0, 60).join("\n");
-    expect(firstSixtyLines).toContain("Search for candidate documents");
-    expect(firstSixtyLines).toContain("qmd search");
-    expect(firstSixtyLines).toContain('qmd multi-get "#abc123,#def432"');
-    expect(firstSixtyLines).toContain("Retrieved:");
-    expect(firstSixtyLines).toContain("qmd query");
-    // The skill must teach structured, self-authored queries near the top.
-    expect(firstSixtyLines).toContain("Default to structured");
-
     const scriptPath = join(root.pathname, "scripts", "check-package-grammars.mjs");
     const script = readFileSync(scriptPath, "utf8");
     expect(script).toContain("tree-sitter-typescript/tree-sitter-typescript.wasm");

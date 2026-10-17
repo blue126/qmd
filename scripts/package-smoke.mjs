@@ -143,6 +143,23 @@ try {
 
   const installedScopeAndName = pkg.name.split("/");
   const installedRoot = join(consumerDir, "node_modules", ...installedScopeAndName);
+  const skillEnv = { ...process.env };
+  delete skillEnv.QMD_SKILLS_DIR;
+  const skill = JSON.parse(capture(
+    "packed runtime skill and references",
+    process.execPath,
+    [join(installedRoot, "dist", "cli", "qmd.js"), "skills", "get", "qmd", "--full", "--json"],
+    { cwd: consumerDir, env: skillEnv },
+  )).data?.[0];
+  if (skill?.content !== readFileSync(join(root, "skills", "qmd", "SKILL.md"), "utf8")) {
+    throw new PackageSmokeError("Packed CLI did not return the current QMD skill");
+  }
+  for (const path of ["references/query-syntax.md", "references/mcp-setup.md"]) {
+    const reference = skill.files?.find(file => file.path === path);
+    if (reference?.content !== readFileSync(join(root, "skills", "qmd", path), "utf8")) {
+      throw new PackageSmokeError(`Packed CLI did not return the current QMD skill reference: ${path}`);
+    }
+  }
   if (existsSync(join(consumerDir, "node_modules", "node-llama-cpp"))) {
     throw new PackageSmokeError("Packed consumer unexpectedly installed a local inference runtime");
   }

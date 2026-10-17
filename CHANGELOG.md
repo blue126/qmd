@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- Replace stale skill prose/line-position assertions with a tarball regression that verifies the installed CLI returns the current QMD skill and both references unchanged.
 - Repeated remote document embeddings across stores: OpenAI-compatible and Voyage providers now deduplicate overlapping batches and reuse validated document vectors. The default module-local LRU remains memory-only; optional `models.embed_cache_dir` enables bounded SQLite persistence, cross-process coordination, and sharing across plugin generations, including directories on tmpfs. Namespaces isolate credentials, endpoint/model/dimension, build identity, and exact formatted input; authorization and build leases remain per store. Forced rebuilds refresh the shared cache, cancelled/crashed writers release their locks, and unavailable caches warn and fall back to computation. Paths support YAML/SDK configuration and existing project trust rules.
 
 - Metadata extraction error retry: `isDocumentMetadataCurrent` now requires an error-free extraction, allowing `qmd update` to automatically re-attempt extraction on documents that previously failed without requiring manual edits.
