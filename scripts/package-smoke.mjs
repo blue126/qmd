@@ -71,6 +71,9 @@ function assertMissing(path, label = path) {
 }
 
 function main() {
+if (pkg.dependencies?.["node-llama-cpp"] || pkg.optionalDependencies?.["node-llama-cpp"]) {
+  throw new PackageSmokeError("Remote-only packages must not depend on node-llama-cpp");
+}
 run("build compiled package", process.execPath, ["scripts/build.mjs"]);
 run("AST grammar runtime packages", process.execPath, ["scripts/check-package-grammars.mjs"]);
 
@@ -111,6 +114,15 @@ try {
     packageSmokeDir,
   ]);
   const packResult = JSON.parse(packOutput);
+  const packedFiles = (packResult[0]?.files ?? []).map(file => file.path);
+  for (const path of packedFiles) {
+    if (/^(?:src|test|tests|tools|node_modules|\.git|\.tmp)\//.test(path) || /\.(?:gguf|safetensors|onnx)$/.test(path)) {
+      throw new PackageSmokeError(`Unexpected source, test, tool, or model in tarball: ${path}`);
+    }
+    if (path.startsWith("dist/") && path.endsWith(".js") && !existsSync(join(root, "src", path.slice(5, -3) + ".ts"))) {
+      throw new PackageSmokeError(`Stale compiled module in tarball: ${path}`);
+    }
+  }
   const tarballName = packResult[0]?.filename;
   if (typeof tarballName !== "string") {
     throw new PackageSmokeError("Package smoke failed: npm pack did not report a tarball filename");
@@ -131,6 +143,9 @@ try {
 
   const installedScopeAndName = pkg.name.split("/");
   const installedRoot = join(consumerDir, "node_modules", ...installedScopeAndName);
+  if (existsSync(join(consumerDir, "node_modules", "node-llama-cpp"))) {
+    throw new PackageSmokeError("Packed consumer unexpectedly installed a local inference runtime");
+  }
   const loaderUrl = pathToFileURL(
     join(installedRoot, "dist", "search", "jieba-loader.js"),
   ).href;

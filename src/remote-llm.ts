@@ -130,6 +130,25 @@ export class RemoteLLM implements LLM {
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly timeoutMs: number;
 
+  private readonly controller = new AbortController();
+  private readonly operations = new Set<Promise<unknown>>();
+  private async operation<T>(run: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    this.controller.signal.throwIfAborted();
+    signal?.throwIfAborted();
+    const pending = run();
+    this.operations.add(pending);
+    try {
+      const result = await pending;
+      this.controller.signal.throwIfAborted();
+      signal?.throwIfAborted();
+      return result;
+    } finally { this.operations.delete(pending); }
+  }
+
+  private requestSignal(signal?: AbortSignal): AbortSignal {
+    return AbortSignal.any([this.controller.signal, AbortSignal.timeout(this.timeoutMs), ...(signal ? [signal] : [])]);
+  }
+
   private generateCircuitBroken = false;
   private rerankCircuitBroken = false;
 
@@ -153,11 +172,11 @@ export class RemoteLLM implements LLM {
   }
 
   get supportsExpand(): boolean {
-    return Boolean(this.generateApiUrl && this.generateApiModel && !this.generateCircuitBroken);
+    return Boolean(this.generateApiUrl && this.generateApiModel && !this.generateCircuitBroken && !this.controller.signal.aborted);
   }
 
   get supportsRerank(): boolean {
-    return Boolean(this.rerankApiUrl && this.rerankApiModel && !this.rerankCircuitBroken);
+    return Boolean(this.rerankApiUrl && this.rerankApiModel && !this.rerankCircuitBroken && !this.controller.signal.aborted);
   }
 
   get rerankModelName(): string | undefined {
@@ -169,19 +188,36 @@ export class RemoteLLM implements LLM {
   }
 
   async embed(_text: string, _options?: EmbedOptions): Promise<EmbeddingResult | null> {
-    // Embedding is handled separately by EmbeddingProvider
-    return null;
+    throw new Error("Embedding requires an authorized remote embedding provider.");
   }
 
-  async generate(_prompt: string, _options?: GenerateOptions): Promise<GenerateResult | null> {
-    return null;
+  async generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null> {
+    return this.operation(() => this.generateRequest(prompt, options), options?.signal);
+  }
+  private async generateRequest(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null> {
+    if (!this.supportsExpand) throw new Error("Remote generation is not configured or circuit is broken.");
+    const response = await this.fetchImpl(this.generateApiUrl!, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(this.generateApiKey ? { authorization: `Bearer ${this.generateApiKey}` } : {}) },
+      body: JSON.stringify({ model: options?.model ?? this.generateApiModel, messages: [{ role: "user", content: prompt }], max_tokens: options?.maxTokens, temperature: options?.temperature }),
+      signal: this.requestSignal(options?.signal),
+    });
+    if (!response.ok) throw new Error(`Remote generation API returned status ${response.status}`);
+    const data = await response.json() as { choices?: Array<{message?: {content?: string}}> };
+    const text = data.choices?.[0]?.message?.content;
+    if (typeof text !== "string") throw new Error("Remote generation returned an invalid response.");
+    return { text, model: this.generateApiModel!, done: true };
   }
 
   async modelExists(_model: string): Promise<ModelInfo> {
-    return { name: _model, path: _model, exists: true };
+    return { name: _model, exists: _model === this.generateApiModel || _model === this.rerankApiModel };
   }
 
-  async expandQuery(
+  async expandQuery(query: string, options?: { context?: string; includeLexical?: boolean; includeHyde?: boolean; timeZone?: string; searchIntent?: SearchIntentGuidance; signal?: AbortSignal }): Promise<Queryable[]> {
+    return this.operation(() => this.expandQueryRequest(query, options), options?.signal);
+  }
+
+  private async expandQueryRequest(
     query: string,
     options?: {
       context?: string;
@@ -189,6 +225,7 @@ export class RemoteLLM implements LLM {
       includeHyde?: boolean;
       timeZone?: string;
       searchIntent?: SearchIntentGuidance;
+      signal?: AbortSignal;
     },
   ): Promise<Queryable[]> {
     if (!this.supportsExpand) {
@@ -298,7 +335,7 @@ Return only the prefix lines specified in the output format.
           ],
           temperature: 0.3,
         }),
-        signal: AbortSignal.timeout(this.timeoutMs),
+        signal: this.requestSignal(options?.signal),
       });
 
       if (!res.ok) {
@@ -331,12 +368,15 @@ Return only the prefix lines specified in the output format.
 
       return results;
     } catch (err) {
-      this.generateCircuitBroken = true;
+      if (!options?.signal?.aborted && !this.controller.signal.aborted) this.generateCircuitBroken = true;
       throw err;
     }
   }
 
   async rerank(query: string, documents: RerankDocument[], options?: RerankOptions | string | (RerankOptions & { timeZone?: string })): Promise<RerankResult> {
+    return this.operation(() => this.rerankRequest(query, documents, options), typeof options === "object" ? options.signal : undefined);
+  }
+  private async rerankRequest(query: string, documents: RerankDocument[], options?: RerankOptions | string | (RerankOptions & { timeZone?: string })): Promise<RerankResult> {
     const model = this.rerankApiModel || (typeof options === "string" ? options : options?.model) || "remote-rerank";
     if (!this.supportsRerank) {
       throw new Error("Remote reranking is not configured or circuit is broken.");
@@ -352,7 +392,7 @@ Return only the prefix lines specified in the output format.
 
     // If explicit chat completions URL is configured for rerank, route directly to LLM chat rerank
     if (this.rerankApiUrl!.endsWith("/chat/completions")) {
-      return this.rerankViaChatCompletions(query, documents, model, timeZoneOption);
+      return this.rerankViaChatCompletions(query, documents, model, timeZoneOption, typeof options === "object" ? options.signal : undefined);
     }
 
     try {
@@ -375,12 +415,12 @@ Return only the prefix lines specified in the output format.
           query,
           documents: docsPayload,
         }),
-        signal: AbortSignal.timeout(this.timeoutMs),
+        signal: this.requestSignal(typeof options === "object" ? options.signal : undefined),
       });
 
       // If /rerank returns 404 (endpoint not supported), fallback to LLM Chat Reranking
       if (res.status === 404) {
-        return this.rerankViaChatCompletions(query, documents, model, timeZoneOption);
+        return this.rerankViaChatCompletions(query, documents, model, timeZoneOption, typeof options === "object" ? options.signal : undefined);
       }
 
       if (!res.ok) {
@@ -405,7 +445,7 @@ Return only the prefix lines specified in the output format.
 
       return { results: formattedResults, model };
     } catch (err) {
-      this.rerankCircuitBroken = true;
+      if (!(typeof options === "object" && options.signal?.aborted) && !this.controller.signal.aborted) this.rerankCircuitBroken = true;
       throw err;
     }
   }
@@ -419,6 +459,7 @@ Return only the prefix lines specified in the output format.
     documents: RerankDocument[],
     model: string,
     timeZoneOption?: string,
+    signal?: AbortSignal,
   ): Promise<RerankResult> {
     const systemPrompt = `<role>
 You are a specialized assistant for document-search relevance reranking.
@@ -521,7 +562,7 @@ Return raw JSON only: start with { and end with }. No Markdown fences.
         ],
         temperature: 0.1,
       }),
-      signal: AbortSignal.timeout(this.timeoutMs),
+      signal: this.requestSignal(signal),
     });
 
     if (!res.ok) {
@@ -599,5 +640,8 @@ Return raw JSON only: start with { and end with }. No Markdown fences.
     return { results: formattedResults.sort((a, b) => b.score - a.score), model };
   }
 
-  async dispose(): Promise<void> { }
+  async dispose(): Promise<void> {
+    this.controller.abort(new Error("Remote model services disposed"));
+    await Promise.allSettled([...this.operations]);
+  }
 }

@@ -1,82 +1,73 @@
-import type {
-  LLM,
-  EmbedOptions,
-  EmbeddingResult,
-  GenerateOptions,
-  GenerateResult,
-  ModelInfo,
-  Queryable,
-  RerankDocument,
-  RerankOptions,
-  RerankResult,
-  SearchIntentGuidance,
+import {
+  ModelConfigurationError,
+  type LLM,
+  type EmbedOptions,
+  type EmbeddingResult,
+  type GenerateOptions,
+  type GenerateResult,
+  type ModelInfo,
+  type ModelResolutionConfig,
+  type Queryable,
+  type RerankDocument,
+  type RerankOptions,
+  type RerankResult,
+  type SearchIntentGuidance,
 } from "./llm.js";
-import type { RemoteLLM } from "./remote-llm.js";
-import type { RemoteJev } from "./remote-jev.js";
+import { RemoteLLM } from "./remote-llm.js";
+import { RemoteJev } from "./remote-jev.js";
 
+/** Remote query services. Embeddings are owned by the store's authorized provider. */
 export class Hybrid implements LLM {
   constructor(
-    private readonly localLLM: LLM,
     private readonly remoteLLM?: RemoteLLM,
     private readonly remoteJev?: RemoteJev,
   ) {}
-
   get jev(): RemoteJev | undefined {
     return this.remoteJev;
   }
-
   get remote(): RemoteLLM | undefined {
     return this.remoteLLM;
   }
-
-  get local(): LLM {
-    return this.localLLM;
-  }
-
   get supportsExpand(): boolean {
-    return Boolean(this.remoteJev?.supportsExpand || this.remoteLLM?.supportsExpand);
+    return Boolean(this.remoteLLM?.supportsExpand);
   }
-
   get supportsRerank(): boolean {
-    return Boolean(this.remoteJev?.supportsRerank || this.remoteLLM?.supportsRerank);
+    return Boolean(
+      this.remoteJev?.supportsRerank || this.remoteLLM?.supportsRerank,
+    );
   }
-
   get rerankModelName(): string | undefined {
-    if (this.remoteJev?.supportsRerank) {
-      return this.remoteJev.rerankModelName;
-    }
-    if (this.remoteLLM?.supportsRerank && this.remoteLLM.rerankModelName) {
-      return this.remoteLLM.rerankModelName;
-    }
-    return (this.localLLM as any).rerankModelName;
+    return this.remoteJev?.rerankModelName ?? this.remoteLLM?.rerankModelName;
   }
-
   get generateModelName(): string | undefined {
-    if (this.remoteLLM?.supportsExpand && this.remoteLLM.generateModelName) {
-      return this.remoteLLM.generateModelName;
-    }
-    return (this.localLLM as any).generateModelName;
+    return this.remoteLLM?.generateModelName;
   }
-
-  async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
-    return this.localLLM.embed(text, options);
+  async embed(
+    _text: string,
+    _options?: EmbedOptions,
+  ): Promise<EmbeddingResult | null> {
+    throw new ModelConfigurationError(
+      "Embedding through an authorized remote embedding provider",
+    );
   }
-
-  async generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null> {
-    return this.localLLM.generate(prompt, options);
+  async generate(
+    prompt: string,
+    options?: GenerateOptions,
+  ): Promise<GenerateResult | null> {
+    if (!this.remoteLLM?.supportsExpand)
+      throw new ModelConfigurationError("Generation");
+    return this.remoteLLM.generate(prompt, options);
   }
-
   async modelExists(model: string): Promise<ModelInfo> {
-    if (this.remoteJev && (model.startsWith("jev:") || model === "jev")) {
-      return { name: model, path: model, exists: true };
-    }
-    if (this.remoteLLM) {
-      const remoteInfo = await this.remoteLLM.modelExists(model);
-      if (remoteInfo.exists) return remoteInfo;
-    }
-    return this.localLLM.modelExists(model);
+    if (
+      this.remoteJev &&
+      (model === this.remoteJev.model ||
+        model.startsWith("jev:") ||
+        model === "jev")
+    )
+      return { name: model, exists: true };
+    return this.remoteLLM?.modelExists(model) ?? { name: model, exists: false };
   }
-
   async expandQuery(
     query: string,
     options?: {
@@ -84,37 +75,31 @@ export class Hybrid implements LLM {
       includeLexical?: boolean;
       includeHyde?: boolean;
       searchIntent?: SearchIntentGuidance;
+      signal?: AbortSignal;
     },
   ): Promise<Queryable[]> {
+    if (!this.remoteLLM?.supportsExpand)
+      throw new ModelConfigurationError("Query expansion");
     let targetOptions = options;
-
     if (this.remoteJev?.supportsExpand) {
       try {
-        const intent = await this.remoteJev.classifyIntent(query, { context: options?.context });
-        if (intent.confidence >= 0.5) {
+        const intent = await this.remoteJev.classifyIntent(query, {
+          context: options?.context,
+          signal: options?.signal,
+        });
+        if (intent.confidence >= 0.5)
           targetOptions = {
             ...options,
             includeHyde: intent.needsHyde,
             searchIntent: intent.strategyDetails,
           };
-        }
-      } catch (err) {
-        console.warn("Remote Jev query expansion classification failed, falling back to direct LLM expansion:", (err as Error).message);
+      } catch (error) {
+        if (options?.signal?.aborted) throw error;
+        // A configured remote generator can still expand without intent guidance.
       }
     }
-
-    if (this.remoteLLM?.supportsExpand) {
-      try {
-        return await this.remoteLLM.expandQuery(query, targetOptions);
-      } catch (err) {
-        // Fallback to local LLM expansion on error
-        console.warn("Remote query expansion failed, falling back to local model:", (err as Error).message);
-      }
-    }
-
-    return this.localLLM.expandQuery(query, targetOptions);
+    return this.remoteLLM.expandQuery(query, targetOptions);
   }
-
   async rerank(
     query: string,
     documents: RerankDocument[],
@@ -123,28 +108,50 @@ export class Hybrid implements LLM {
     if (this.remoteJev?.supportsRerank) {
       try {
         return await this.remoteJev.rerank(query, documents, options);
-      } catch (err) {
-        console.warn("Remote Jev rerank failed, falling back to remote/local LLM:", (err as Error).message);
+      } catch (error) {
+        if (options?.signal?.aborted || !this.remoteLLM?.supportsRerank)
+          throw error;
       }
     }
-
-    if (this.remoteLLM?.supportsRerank) {
-      try {
-        return await this.remoteLLM.rerank(query, documents, options);
-      } catch (err) {
-        // Fallback to local LLM reranking on error
-        console.warn("Remote rerank failed, falling back to local model:", (err as Error).message);
-      }
-    }
-
-    return this.localLLM.rerank(query, documents, options);
+    if (this.remoteLLM?.supportsRerank)
+      return this.remoteLLM.rerank(query, documents, options);
+    throw new ModelConfigurationError("Reranking");
   }
-
   async dispose(): Promise<void> {
-    await Promise.all([
-      this.localLLM.dispose(),
-      this.remoteLLM?.dispose(),
-      this.remoteJev?.dispose(),
-    ]);
+    await Promise.all([this.remoteLLM?.dispose(), this.remoteJev?.dispose()]);
   }
+}
+
+/** Shared SDK/CLI setup; constructing services never sends a model request. */
+export function createConfiguredLLM(
+  models?: ModelResolutionConfig,
+  options: { timeoutMs?: number } = {},
+): Hybrid {
+  const remote = new RemoteLLM({
+    generateUrl: models?.generate_url,
+    generateBaseUrl: models?.generate_base_url,
+    generateApiUrl: models?.generate_api_url,
+    generateApiModel: models?.generate_api_model,
+    generateApiKey: models?.generate_api_key,
+    rerankUrl: models?.rerank_url,
+    rerankBaseUrl: models?.rerank_base_url,
+    rerankApiUrl: models?.rerank_api_url,
+    rerankApiModel: models?.rerank_api_model,
+    rerankApiKey: models?.rerank_api_key,
+    timeoutMs: options.timeoutMs,
+  });
+  const apiKey =
+    models?.jev_api_key?.trim() || process.env.TYPESAFE_API_KEY?.trim();
+  const jev = apiKey
+    ? new RemoteJev({
+        apiKey,
+        baseUrl:
+          models?.jev_base_url?.trim() || process.env.TYPESAFE_BASE_URL?.trim(),
+        model:
+          models?.jev_api_model?.trim() ||
+          process.env.TYPESAFE_DEFAULT_MODEL?.trim(),
+        timeoutMs: options.timeoutMs,
+      })
+    : undefined;
+  return new Hybrid(remote, jev);
 }

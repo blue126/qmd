@@ -113,6 +113,7 @@ export class UnavailableOpenAIEmbeddingProvider implements EmbeddingProvider {
   readonly model: OpenAIEmbeddingModel;
   readonly dimension: number;
   readonly remote = true;
+  readonly available = false;
   private readonly configuredBaseUrl: string | undefined;
 
   constructor(options?: { model?: OpenAIEmbeddingModel; dimension?: number; baseUrl?: string }) {

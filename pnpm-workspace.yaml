@@ -2,32 +2,18 @@ allowBuilds:
   "@node-rs/jieba": true
   better-sqlite3: true
   esbuild: true
-  node-llama-cpp: true
   tree-sitter-go: true
   tree-sitter-javascript: true
   tree-sitter-python: true
   tree-sitter-rust: true
   tree-sitter-typescript: true
-
 overrides:
-  "@hono/node-server": 2.1.2
-  ajv: 8.20.0
   esbuild: 0.28.2
-  fast-uri: 3.1.5
-  hono: 4.13.10
-  ip-address: 10.7.2
   nanoid: 3.3.18
-  path-to-regexp: 8.4.2
   postcss: 8.5.28
-  qs: 6.16.0
   rollup: 4.63.5
-  simple-git: 4.0.2
   source-map-js: 1.2.2
-  tar: 7.5.22
   vite: 7.3.5
-
 audit:
   ignore:
     - GHSA-vfj7-8cjw-p6xm
-
-

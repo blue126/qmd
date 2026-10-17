@@ -3,11 +3,11 @@ import { readFileSync } from "fs";
 import { join } from "path";
 
 describe("LLM module loading", () => {
-  test("node-llama-cpp is only dynamically imported by LLM operations", () => {
+  test("the inference module has no native model dependency", () => {
     const source = readFileSync(join(process.cwd(), "src", "llm.ts"), "utf-8");
 
     expect(source).not.toMatch(/import\s+(?!type\b)[\s\S]*?from\s+["']node-llama-cpp["']/);
-    expect(source).toContain('import("node-llama-cpp")');
+    expect(source).not.toMatch(/import\s*\(["']node-llama-cpp["']\)/);
   });
 
   test("importing the CLI for lightweight commands succeeds", async () => {

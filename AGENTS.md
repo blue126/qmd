@@ -21,7 +21,7 @@ qmd status                        # Show index status and collections
 qmd doctor                        # Diagnose config, index, model, and device issues
 qmd update                        # Re-index collections; configured update hooks run first
 qmd trust [list|revoke]           # Approve a checked-in .qmd config's hooks/paths/models
-qmd embed                         # Generate vector embeddings (uses node-llama-cpp)
+qmd embed                         # Generate vectors through the configured remote embedding API
 qmd query <query>                 # Search with query expansion + reranking (recommended)
 qmd search <query>                # Full-text keyword search (BM25, no LLM)
 qmd vsearch <query>               # Vector similarity search (no reranking)
@@ -161,7 +161,7 @@ pnpm run measure:cjk    # Measure CJK rebuild latency, DB payload size, and reca
 
 - SQLite FTS5 for full-text search (BM25)
 - sqlite-vec for vector similarity search
-- node-llama-cpp for embeddings (embeddinggemma), reranking (qwen3-reranker), and query expansion (Qwen3)
+- Remote embedding APIs (OpenAI-compatible and Voyage), expansion/reranking endpoints, and TypeSafe Jev; no local inference or model downloads
 - Reciprocal Rank Fusion (RRF) for combining results
 - Smart chunking: 900 tokens/chunk with 15% overlap, prefers markdown headings as boundaries
 - AST-aware chunking: use `--chunk-strategy auto` to chunk code files (.ts/.js/.py/.go/.rs) at function/class/import boundaries via tree-sitter. Default is `regex` (existing behavior). Markdown and unknown file types always use regex chunking.
@@ -188,3 +188,14 @@ Key points:
 - The release script renames `[Unreleased]` → `[X.Y.Z] - date` at release time
 - Credit external PRs with `#NNN (thanks @username)`
 - GitHub releases roll up the full minor series (e.g. 1.2.0 through 1.2.3)
+
+## Remote-only runtime
+
+This review build is `2026.10.18-remote.0`. Keep BM25, CJK, AST, reads, collections,
+contexts, and maintenance usable without models. Configure remote operations
+through existing `models.embed_*`, `generate_*`, `rerank_*`, and `jev_*` fields.
+Never add automatic remote requests, local inference fallback, model downloads,
+or automatic migration/deletion of old vectors. Old local databases remain
+lexically readable; vector conversion requires an explicit manual remote rebuild.
+`qmd pull` is retired and must exit nonzero without downloads. Tests and package
+smoke use mocks or loopback HTTP, with no paid API or local-model setup.

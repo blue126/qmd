@@ -31,6 +31,25 @@ function createMockLlm(overrides: Partial<LLM> = {}): LLM {
   };
 }
 
+
+function attachRemoteProvider(store: ReturnType<typeof createStore>, service: any): void {
+  const model = service.embedModelName;
+  const provider: EmbeddingProvider = {
+    providerId:"remote-test", model, dimension:2, remote:true,
+    canonicalIdentityMaterial: () => JSON.stringify({provider:"remote-test",model,dimension:2}),
+    formatQuery: query => `task: search result | query: ${query}`,
+    formatDocument: text => text,
+    embed: async text => ({vector:(await service.embed(text)).embedding,model,dimension:2}),
+    embedBatch: async texts => (await service.embedBatch(texts)).map((result: any) => ({vector:result.embedding,model,dimension:2})),
+    close: async () => {},
+  };
+  store.embeddingProvider = provider;
+  store.authorizeRemoteRequest = () => {};
+  const identity = remoteEmbeddingIdentity(provider);
+  const lease = beginEmbeddingBuild(store.db, identity, {ownerId:"remote-test",now:Date.now(),leaseMs:60_000,allowDestructiveRebuild:true});
+  store.ensureVecTable(2);
+  completeEmbeddingBuild(store.db, lease);
+}
 describe("In-flight Singleflight Deduplication & In-Memory LRU Cache", () => {
   beforeEach(() => {
     resetInflightState();
@@ -358,12 +377,12 @@ describe("In-flight Singleflight Deduplication & In-Memory LRU Cache", () => {
       expect(res5.embeddings[0]).toEqual([0.1, 0.2]); // query 1 was from cache
     });
 
-    test("deduplicates concurrent batch embedding calls with local LLM and caches in memory", async () => {
+    test("deduplicates concurrent batch embedding calls with a remote provider and caches in memory", async () => {
       const store = createStore(":memory:");
       let llmBatchCallCount = 0;
 
       const mockLlama = {
-        embedModelName: "local-embedding-model",
+        embedModelName: "remote-embedding-model",
         embedBatch: vi.fn(async (texts: string[]) => {
           llmBatchCallCount++;
           await new Promise(resolve => setTimeout(resolve, 50));
@@ -373,7 +392,7 @@ describe("In-flight Singleflight Deduplication & In-Memory LRU Cache", () => {
         }),
       };
 
-      (store as { localLlm?: typeof mockLlama }).localLlm = mockLlama;
+      attachRemoteProvider(store, mockLlama);
 
       const queries = ["alpha", "beta"];
 
@@ -403,7 +422,7 @@ describe("In-flight Singleflight Deduplication & In-Memory LRU Cache", () => {
       const embeddedCalls: string[] = [];
 
       const mockLlama = {
-        embedModelName: "local-embedding-model",
+        embedModelName: "remote-embedding-model",
         embedBatch: vi.fn(async () => {
           throw new Error("Batch embed failed, please fall back");
         }),
@@ -413,7 +432,7 @@ describe("In-flight Singleflight Deduplication & In-Memory LRU Cache", () => {
         }),
       };
 
-      (store as { localLlm?: typeof mockLlama }).localLlm = mockLlama;
+      attachRemoteProvider(store, mockLlama);
 
       const queries = ["query A", "query B"];
       const res = await embedQueriesForStore(store, queries);
@@ -435,7 +454,7 @@ describe("In-flight Singleflight Deduplication & In-Memory LRU Cache", () => {
       const embeddedBatches: string[][] = [];
 
       const mockLlama = {
-        embedModelName: "local-embedding-model",
+        embedModelName: "remote-embedding-model",
         embedBatch: vi.fn(async (texts: string[]) => {
           embeddedBatches.push([...texts]);
           await new Promise(resolve => setTimeout(resolve, 50));
@@ -445,7 +464,7 @@ describe("In-flight Singleflight Deduplication & In-Memory LRU Cache", () => {
         }),
       };
 
-      (store as { localLlm?: typeof mockLlama }).localLlm = mockLlama;
+      attachRemoteProvider(store, mockLlama);
 
       // Request 1 asks for ["alpha", "beta"]
       // Request 2 asks for ["beta", "gamma"] concurrently
@@ -471,7 +490,7 @@ describe("In-flight Singleflight Deduplication & In-Memory LRU Cache", () => {
       let resolveBatch: ((val: Array<{ embedding: number[] }>) => void) | undefined;
 
       const mockLlama = {
-        embedModelName: "local-embedding-model",
+        embedModelName: "remote-embedding-model",
         embedBatch: vi.fn(async (texts: string[]) => {
           return new Promise<Array<{ embedding: number[] }>>(resolve => {
             resolveBatch = resolve;
@@ -479,7 +498,7 @@ describe("In-flight Singleflight Deduplication & In-Memory LRU Cache", () => {
         }),
       };
 
-      (store as { localLlm?: typeof mockLlama }).localLlm = mockLlama;
+      attachRemoteProvider(store, mockLlama);
 
       // Start embedding in flight
       const promise = embedQueriesForStore(store, ["stale query"]);
@@ -495,7 +514,7 @@ describe("In-flight Singleflight Deduplication & In-Memory LRU Cache", () => {
       expect(res.embeddings).toEqual([[0.7, 0.9]]);
 
       // BUT memoryEmbeddingCache must NOT be repopulated with the invalidated pre-clear result!
-      const modelId = "llm:local-embedding-model";
+      const modelId = `provider:${remoteEmbeddingIdentity(store.embeddingProvider!).fingerprint}`;
       expect(memoryEmbeddingCache.get(`${modelId}:stale query`)).toBeUndefined();
     });
   });

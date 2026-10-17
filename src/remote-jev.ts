@@ -75,6 +75,20 @@ export interface JevIntentClassification {
 }
 
 export class RemoteJev {
+  private readonly controller = new AbortController();
+  private readonly operations = new Set<Promise<unknown>>();
+  private async operation<T>(run: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    this.controller.signal.throwIfAborted();
+    signal?.throwIfAborted();
+    const pending = run(); this.operations.add(pending);
+    try {
+      const result = await pending;
+      this.controller.signal.throwIfAborted();
+      signal?.throwIfAborted();
+      return result;
+    } finally { this.operations.delete(pending); }
+  }
+  private requestSignal(signal?: AbortSignal): AbortSignal { return AbortSignal.any([this.controller.signal, ...(signal ? [signal] : [])]); }
   readonly model: string;
   readonly concurrency: number;
   readonly batchSize: number;
@@ -100,11 +114,11 @@ export class RemoteJev {
   }
 
   get supportsRerank(): boolean {
-    return true;
+    return !this.controller.signal.aborted;
   }
 
   get supportsExpand(): boolean {
-    return true;
+    return !this.controller.signal.aborted;
   }
 
   get rerankModelName(): string {
@@ -115,9 +129,12 @@ export class RemoteJev {
     // Kept for interface compatibility; error handling is handled per-request in caller/fallback
   }
 
-  async classifyIntent(
+  async classifyIntent(query: string, options?: { context?: string; timeZone?: string; signal?: AbortSignal }): Promise<JevIntentClassification> {
+    return this.operation(() => this.classifyIntentRequest(query, options), options?.signal);
+  }
+  private async classifyIntentRequest(
     query: string,
-    options?: { context?: string; timeZone?: string },
+    options?: { context?: string; timeZone?: string; signal?: AbortSignal },
   ): Promise<JevIntentClassification> {
     const state: Record<string, string> = { query };
     if (options?.context) {
@@ -148,7 +165,7 @@ export class RemoteJev {
           },
         ),
       },
-    });
+    }, { signal: this.requestSignal(options?.signal) });
 
     const strategyChoice = response.answers.strategy.choice;
     return {
@@ -160,7 +177,10 @@ export class RemoteJev {
     };
   }
 
-  async rerank(
+  async rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult> {
+    return this.operation(() => this.rerankRequest(query, documents, options), typeof options === "object" ? options.signal : undefined);
+  }
+  private async rerankRequest(
     query: string,
     documents: RerankDocument[],
     options?: RerankOptions,
@@ -214,7 +234,7 @@ export class RemoteJev {
           state,
           model: this.model,
           questions,
-        });
+        }, { signal: this.requestSignal(options?.signal) });
 
         const results: RerankDocumentResult[] = [];
         for (let i = 0; i < batchDocs.length; i++) {
@@ -245,7 +265,8 @@ export class RemoteJev {
   }
 
   async dispose(): Promise<void> {
-    // No persistent connections or handles to close
+    this.controller.abort(new Error("Remote Jev disposed"));
+    await Promise.allSettled([...this.operations]);
   }
 }
 
@@ -267,6 +288,7 @@ async function pMap<T, R>(
   const results = new Array<R>(items.length);
   let nextIndex = 0;
   let hasFailed = false;
+  let firstError: unknown;
 
   async function worker() {
     while (nextIndex < items.length && !hasFailed) {
@@ -276,6 +298,7 @@ async function pMap<T, R>(
         try {
           results[currentIndex] = await mapper(item, currentIndex);
         } catch (err) {
+          if (!hasFailed) firstError = err;
           hasFailed = true;
           throw err;
         }
@@ -285,6 +308,7 @@ async function pMap<T, R>(
 
   const workerCount = Math.max(1, Math.min(concurrency, items.length));
   const workers = Array.from({ length: workerCount }, () => worker());
-  await Promise.all(workers);
+  await Promise.allSettled(workers);
+  if (hasFailed) throw firstError;
   return results;
 }

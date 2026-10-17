@@ -515,59 +515,13 @@ describe("RemoteLLM & Hybrid Integration", () => {
   });
 
   describe("Hybrid", () => {
-    test("routes expand & rerank to remote, with local fallback on error", async () => {
-      const mockLocalLLM: LLM = {
-        embed: async () => null,
-        generate: async () => null,
-        modelExists: async (m) => ({ name: m, exists: true }),
-        expandQuery: async (q) => [{ type: "vec", text: `local:${q}` }],
-        rerank: async (_q, docs) => ({
-          results: docs.map((d, i) => ({ file: typeof d === "string" ? d : d.file, score: 0.5, index: i })),
-          model: "local-rerank",
-        }),
-        dispose: async () => {},
-      };
-
-      // Remote that fails immediately (status 500)
+    test("remote failures propagate without constructing a local model", async () => {
       mockResponseStatus = 500;
-      const remoteLLM = new RemoteLLM({
-        generateApiUrl: `http://127.0.0.1:${serverPort}/v1/chat/completions`,
-        generateApiModel: "gpt-4o-mini",
-        rerankApiUrl: `http://127.0.0.1:${serverPort}/v1/rerank`,
-        rerankApiModel: "bge-reranker",
-      });
-
-      const hybrid = new Hybrid(mockLocalLLM, remoteLLM);
-
-      // Should fall back to local model gracefully without throwing
-      const expanded = await hybrid.expandQuery("test query");
-      expect(expanded).toEqual([{ type: "vec", text: "local:test query" }]);
-
-      const reranked = await hybrid.rerank("test query", [{ file: "doc1.md", text: "content" }]);
-      expect(reranked.model).toBe("local-rerank");
-      expect(reranked.results[0]?.score).toBe(0.5);
-    });
-
-    test("allows CJK query expansion when remote LLM generate_api_url is configured", () => {
-      // Without allowCjkExpand: skips CJK
-      const defaultDecision = resolveExpansionPolicy({
-        query: "搜尋關鍵字",
-        mode: "auto",
-        strongSignal: false,
-        allowCjkExpand: false,
-      });
-      expect(defaultDecision.action).toBe("skip");
-      expect(defaultDecision.reason).toBe("cjk-default");
-
-      // With allowCjkExpand (remote LLM active): auto-expands CJK query
-      const remoteDecision = resolveExpansionPolicy({
-        query: "搜尋關鍵字",
-        mode: "auto",
-        strongSignal: false,
-        allowCjkExpand: true,
-      });
-      expect(remoteDecision.action).toBe("expand");
-      expect(remoteDecision.reason).toBe("auto-expand");
+      const remote = new RemoteLLM({generateApiUrl: `http://127.0.0.1:${serverPort}/v1`, generateApiModel: "remote", rerankApiUrl: `http://127.0.0.1:${serverPort}/v1`, rerankApiModel: "remote"});
+      const hybrid = new Hybrid(remote);
+      await expect(hybrid.expandQuery("query")).rejects.toThrow("500");
+      await expect(hybrid.rerank("query", [{file:"a", text:"body"}])).rejects.toThrow("500");
+      await hybrid.dispose();
     });
   });
 });

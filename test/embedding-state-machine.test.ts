@@ -563,8 +563,14 @@ describe("embedding identity state machine", () => {
 
   test("vector search excludes metadata rows with a stale full fingerprint", async () => {
     const store = await createTempStore();
-    const model = "local-search-model";
-    const activeIdentity = localIdentity(model);
+    const model = "remote-search-model";
+    const provider = new OpenAIEmbeddingProvider({
+      apiKey: "test-only-key",
+      model,
+      dimension: 3,
+      fetch: async () => { throw new Error("Precomputed searches must not call the provider"); },
+    });
+    const activeIdentity = remoteEmbeddingIdentity(provider);
     const activeFingerprint = activeIdentity.fingerprint;
     const now = new Date(0).toISOString();
     try {
@@ -608,6 +614,7 @@ describe("embedding identity state machine", () => {
         undefined,
         undefined,
         [1, 0, 0],
+        provider,
       );
       expect(results.map(result => result.displayPath)).toEqual(["docs/live.md"]);
     } finally {
@@ -617,8 +624,14 @@ describe("embedding identity state machine", () => {
 
   test("vector search applies the full fingerprint before global KNN truncation", async () => {
     const store = await createTempStore();
-    const model = "local-search-model";
-    const activeIdentity = localIdentity(model);
+    const model = "remote-search-model";
+    const provider = new OpenAIEmbeddingProvider({
+      apiKey: "test-only-key",
+      model,
+      dimension: 3,
+      fetch: async () => { throw new Error("Precomputed searches must not call the provider"); },
+    });
+    const activeIdentity = remoteEmbeddingIdentity(provider);
     const activeFingerprint = activeIdentity.fingerprint;
     const now = new Date(0).toISOString();
     try {
@@ -667,6 +680,7 @@ describe("embedding identity state machine", () => {
         undefined,
         undefined,
         [1, 0, 0],
+        provider,
       );
 
       expect(results.map(result => result.displayPath)).toEqual(["docs/active.md"]);
@@ -677,8 +691,14 @@ describe("embedding identity state machine", () => {
 
   test("vector search applies collection filters before truncating more than 4,096 KNN candidates", async () => {
     const store = await createTempStore();
-    const model = "local-search-model";
-    const activeIdentity = localIdentity(model);
+    const model = "remote-search-model";
+    const provider = new OpenAIEmbeddingProvider({
+      apiKey: "test-only-key",
+      model,
+      dimension: 3,
+      fetch: async () => { throw new Error("Precomputed searches must not call the provider"); },
+    });
+    const activeIdentity = remoteEmbeddingIdentity(provider);
     const fingerprint = activeIdentity.fingerprint;
     const now = new Date(0).toISOString();
     try {
@@ -731,6 +751,7 @@ describe("embedding identity state machine", () => {
         ["target"],
         undefined,
         [1, 0, 0],
+        provider,
       );
 
       expect(results.map(result => result.displayPath)).toEqual(["target/only.md"]);

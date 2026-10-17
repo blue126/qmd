@@ -92,7 +92,7 @@ that is a job for `qmd search`, not bare `qmd query`:
 qmd query --format json --explain $'intent: ...\nlex: ...\nvec: ...'  # inspect ranking
 ```
 
-If `qmd query` is slow or model/GPU setup fails, fall back to `qmd search` with
+If `qmd query` is slow or remote model configuration fails, fall back to `qmd search` with
 better lexical terms.
 
 ## Retrieve sources
@@ -282,10 +282,9 @@ Configure models and custom endpoints in `~/.config/qmd/index.yml` under the `mo
 
 ```yaml
 models:
-  embed: hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf
   embed_api_url: https://api.example.com/v1 # Both embed_api_url and embed_api_model enable remote embeddings
   embed_api_model: text-embedding-3-small # or text-embedding-3-large
-  embed_dimension: 1536 # Optional: expected vector dimension; validates local output
+  embed_dimension: 1536 # Optional: expected vector dimension; validates remote output
 
   # Optional: Remote LLM Query Expansion (aliases: generate_url, generate_base_url, generate_api_url)
   generate_api_url: https://api.example.com/v1 # Base URL (appends /chat/completions) or full endpoint
@@ -310,10 +309,9 @@ Health and diagnostics:
 ```bash
 qmd doctor
 qmd status
-qmd pull
 ```
 
-`qmd doctor` checks config, model cache, device/GPU setup, vector fingerprints, CJK channel readiness, and common environment overrides. If a model-backed command fails, run it before changing configuration.
+`qmd doctor` checks config, remote model settings, vector fingerprints, CJK channel readiness, and common environment overrides without issuing model requests. If a model-backed command fails, run it before changing configuration.
 
 ## MCP setup
 
@@ -334,10 +332,15 @@ server configuration.
 - **Do not mutate indexes casually.** `qmd collection add`, `qmd update`, and
   `qmd embed` change local state and can be expensive.
 - **Model-backed commands can be environment-sensitive.** If `qmd query`,
-  `qmd vsearch`, or reranking fails because local models/GPU are unavailable,
+  `qmd vsearch`, or reranking fails because remote providers are unavailable,
   use `qmd search` and stronger lexical/structured terms.
 - **Ambiguous user wording needs intent.** Add `intent:` rather than hoping query
   expansion guesses the right domain.
 - **Collection names matter.** Search `concepts` for synthesized wiki pages,
   `sources` for transcripts/raw source pages, and docs collections for code or
   project documentation.
+
+Local model inference and `qmd pull` are retired in remote-only builds. Existing
+local-model databases remain available for lexical reads. Rebuilding them for a
+remote provider requires the user to explicitly request `qmd embed --force`; do
+not auto-convert, clear vectors, download models, or make hidden remote requests.

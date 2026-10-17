@@ -22,7 +22,7 @@ import {
   type VectorSearchOptions,
   type ExpandQueryOptions,
 } from "../src/index.js";
-import { setDefaultLlamaCpp, withLLMSessionForLlm } from "../src/llm.js";
+import { withLLMSessionForLlm } from "../src/llm.js";
 
 // =============================================================================
 // Test Helpers
@@ -152,20 +152,20 @@ describe("createStore", () => {
       dbPath: freshDbPath(),
       config: {
         collections: {},
-        embedding: { provider: "local", model: "local-model-a" },
+        models: { embed_api_url: "http://127.0.0.1:9/v1", embed_api_model: "remote-model-a", embed_dimension: 3 },
       },
     });
     const second = await createStore({
       dbPath: freshDbPath(),
       config: {
         collections: {},
-        embedding: { provider: "local", model: "local-model-b" },
+        models: { embed_api_url: "http://127.0.0.1:9/v1", embed_api_model: "remote-model-b", embed_dimension: 3 },
       },
     });
 
     try {
-      expect(first.internal.embeddingProvider?.model).toBe("local-model-a");
-      expect(second.internal.embeddingProvider?.model).toBe("local-model-b");
+      expect(first.internal.embeddingProvider?.model).toBe("remote-model-a");
+      expect(second.internal.embeddingProvider?.model).toBe("remote-model-b");
     } finally {
       await Promise.all([first.close(), second.close()]);
     }
@@ -177,20 +177,20 @@ describe("createStore", () => {
       dbPath,
       config: {
         collections: {},
-        embedding: { provider: "local", model: "persisted-local-model" },
+        models: { embed_api_url: "http://127.0.0.1:9/v1", embed_api_model: "persisted-remote-model", embed_dimension: 3 },
       },
     });
     await configured.close();
 
     const reopened = await createStore({ dbPath });
     try {
-      expect(reopened.internal.embeddingProvider?.model).toBe("persisted-local-model");
+      expect(reopened.internal.embeddingProvider?.model).toBe("persisted-remote-model");
     } finally {
       await reopened.close();
     }
   });
 
-  test("closes the owned provider and Llama instance exactly once", async () => {
+  test("closes the owned provider and remote runtime exactly once", async () => {
     const store = await createStore({
       dbPath: freshDbPath(),
       config: { collections: {} },
@@ -1120,26 +1120,14 @@ describe("update", () => {
 });
 
 describe("embed", () => {
-  function createFakeTokenizer() {
-    return {
-      async tokenize(text: string) {
-        return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
-      },
-      async detokenize(tokens: readonly number[]) {
-        return "x".repeat(tokens.length * 16);
-      },
-    };
-  }
-
   function createFakeEmbedProvider() {
     const embedBatchCalls: string[][] = [];
     return {
-      ...createFakeTokenizer(),
       embedBatchCalls,
       providerId: "fake",
       model: "fake-embed",
       dimension: 3,
-      remote: false,
+      remote: true,
       canonicalIdentityMaterial: () => "fake-embed:3",
       formatQuery: (query: string) => `query:${query}`,
       formatDocument: (text: string, title?: string) => title ? `${title}\n${text}` : text,
@@ -1169,7 +1157,7 @@ describe("embed", () => {
     });
 
     const fakeProvider = createFakeEmbedProvider();
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
+
     store.internal.embeddingProvider = fakeProvider;
 
     try {
@@ -1184,7 +1172,6 @@ describe("embed", () => {
       expect(result.docsProcessed).toBe(3);
       expect(result.chunksEmbedded).toBe(3);
     } finally {
-      setDefaultLlamaCpp(null);
       await store.close();
     }
   });
@@ -1205,11 +1192,7 @@ describe("embed", () => {
     remoteProvider.remote = true;
     remoteProvider.providerId = "fake-remote";
     remoteProvider.canonicalIdentityMaterial = () => "fake-remote:utf8-window-v1:3";
-    setDefaultLlamaCpp({
-      async tokenize() {
-        throw new Error("remote embedding must not load or call a local tokenizer");
-      },
-    } as any);
+
     store.internal.embeddingProvider = remoteProvider;
 
     try {
@@ -1222,7 +1205,6 @@ describe("embed", () => {
       expect(remoteProvider.embedBatchCalls.flat().every(input => new TextEncoder().encode(input).byteLength <= 8_192))
         .toBe(true);
     } finally {
-      setDefaultLlamaCpp(null);
       await store.close();
     }
   });
@@ -1249,7 +1231,7 @@ describe("embed", () => {
       singleCalls += 1;
       return { vector: [0.1, 0.2, 0.3], model: "fake-embed", dimension: 3 };
     };
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
+
     store.internal.embeddingProvider = fakeProvider;
 
     try {
@@ -1258,7 +1240,6 @@ describe("embed", () => {
       expect(result.chunksEmbedded).toBe(3);
       expect(singleCalls).toBe(3);
     } finally {
-      setDefaultLlamaCpp(null);
       await store.close();
     }
   });
@@ -1284,7 +1265,7 @@ describe("embed", () => {
     fakeProvider.embed = async () => {
       throw new Error("simulated partial failure");
     };
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
+
     store.internal.embeddingProvider = fakeProvider;
 
     try {
@@ -1312,7 +1293,6 @@ describe("embed", () => {
       expect(resumed.chunksEmbedded).toBe(missingChunks);
       expect(resumedInputs).toBe(missingChunks);
     } finally {
-      setDefaultLlamaCpp(null);
       await store.close();
       await rm(partialDir, { recursive: true, force: true });
     }
@@ -1328,7 +1308,7 @@ describe("embed", () => {
       },
     });
     const initialProvider = createFakeEmbedProvider();
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
+
     store.internal.embeddingProvider = initialProvider;
 
     try {
@@ -1357,7 +1337,6 @@ describe("embed", () => {
         SELECT 1 FROM vectors_vec WHERE hash_seq = ?
       `).get(`${missing.hash}_${missing.seq}`)).toBeDefined();
     } finally {
-      setDefaultLlamaCpp(null);
       await store.close();
     }
   });
@@ -1372,7 +1351,7 @@ describe("embed", () => {
       },
     });
     const initialProvider = createFakeEmbedProvider();
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
+
     store.internal.embeddingProvider = initialProvider;
 
     try {
@@ -1399,7 +1378,6 @@ describe("embed", () => {
         SELECT status FROM embedding_index_state WHERE singleton = 1
       `).get()).toMatchObject({ status: "ready" });
     } finally {
-      setDefaultLlamaCpp(null);
       await store.close();
     }
   });
@@ -1414,7 +1392,7 @@ describe("embed", () => {
       },
     });
     const initialProvider = createFakeEmbedProvider();
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
+
     store.internal.embeddingProvider = initialProvider;
 
     try {
@@ -1452,7 +1430,6 @@ describe("embed", () => {
         SELECT status FROM embedding_index_state WHERE singleton = 1
       `).get()).toMatchObject({ status: "ready" });
     } finally {
-      setDefaultLlamaCpp(null);
       await store.close();
     }
   });
@@ -1468,7 +1445,7 @@ describe("embed", () => {
     });
 
     const fakeProvider = createFakeEmbedProvider();
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
+
     store.internal.embeddingProvider = fakeProvider;
 
     try {
@@ -1506,12 +1483,11 @@ describe("embed", () => {
       expect(second.docsProcessed).toBe(0);
       expect(fakeProvider.embedBatchCalls).toHaveLength(callsAfterFirst);
     } finally {
-      setDefaultLlamaCpp(null);
       await store.close();
     }
   });
 
-  test("store.embed acquires the identity lease after probing an unknown dimension", async () => {
+  test("store.embed rejects an unknown remote dimension before model requests or mutations", async () => {
     const store = await createStore({
       dbPath: freshDbPath(),
       config: {
@@ -1524,7 +1500,7 @@ describe("embed", () => {
     const provider = {
       providerId: "probe-provider",
       model: "probe-model",
-      remote: false,
+      remote: true,
       get dimension() { return dimension; },
       canonicalIdentityMaterial() {
         if (dimension === null) throw new Error("dimension unknown");
@@ -1542,33 +1518,22 @@ describe("embed", () => {
       },
       async close() {},
     };
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
+
     store.internal.embeddingProvider = provider;
 
     try {
       await store.update();
-      const result = await store.embed();
-      const state = store.internal.db.prepare(`
-        SELECT status, provider_id, model, dimension, lease_owner
-        FROM embedding_index_state
-        WHERE singleton = 1
-      `).get();
-
-      expect(result.errors).toBe(0);
-      expect(state).toEqual({
-        status: "ready",
-        provider_id: "probe-provider",
-        model: "probe-model",
-        dimension: 3,
-        lease_owner: null,
-      });
+      const before = store.internal.db.prepare("SELECT * FROM embedding_index_state").all();
+      await expect(store.embed()).rejects.toThrow("matching active embedding identity");
+      expect(dimension).toBeNull();
+      expect(store.internal.db.prepare("SELECT * FROM embedding_index_state").all()).toEqual(before);
+      expect(store.internal.db.prepare("SELECT COUNT(*) AS count FROM content_vectors").get()).toEqual({ count: 0 });
     } finally {
-      setDefaultLlamaCpp(null);
       await store.close();
     }
   });
 
-  test("store.embed reuses a persisted identity before loading an unknown-dimension provider", async () => {
+  test("store.embed reuses a matching persisted remote identity without model requests", async () => {
     const dbPath = freshDbPath();
     const config = {
       collections: {
@@ -1576,7 +1541,7 @@ describe("embed", () => {
       },
     };
     const firstStore = await createStore({ dbPath, config });
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
+
     firstStore.internal.embeddingProvider = createFakeEmbedProvider();
     await firstStore.update();
     await firstStore.embed();
@@ -1587,9 +1552,9 @@ describe("embed", () => {
     const provider = {
       providerId: "fake",
       model: "fake-embed",
-      dimension: null,
-      remote: false,
-      canonicalIdentityMaterial() { throw new Error("model must not load"); },
+      dimension: 3,
+      remote: true,
+      canonicalIdentityMaterial: () => "fake-embed:3",
       canonicalIdentityMaterialForDimension: (dimension: number) => `fake-embed:${dimension}`,
       formatQuery: (query: string) => query,
       formatDocument: (text: string) => text,
@@ -1610,7 +1575,6 @@ describe("embed", () => {
       expect(result.docsProcessed).toBe(0);
       expect(providerCalls).toBe(0);
     } finally {
-      setDefaultLlamaCpp(null);
       await secondStore.close();
     }
   });
@@ -1624,7 +1588,7 @@ describe("embed", () => {
         },
       },
     });
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
+
     const provider = createFakeEmbedProvider();
     const originalEmbedBatch = provider.embedBatch.bind(provider);
     const expirations: number[] = [];
@@ -1646,7 +1610,7 @@ describe("embed", () => {
       expect(new Set(expirations).size).toBe(expirations.length);
     } finally {
       clock.mockRestore();
-      setDefaultLlamaCpp(null);
+
       await store.close();
     }
   });
@@ -1663,7 +1627,7 @@ describe("embed", () => {
     });
 
     const fakeProvider = createFakeEmbedProvider();
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
+
     store.internal.embeddingProvider = fakeProvider;
 
     try {
@@ -1686,12 +1650,11 @@ describe("embed", () => {
         { collection: "notes", count: 0 },
       ]);
     } finally {
-      setDefaultLlamaCpp(null);
       await store.close();
     }
   });
 
-  test("store.embed with force only clears the requested collection", async () => {
+  test("store.embed rejects collection-scoped destructive remote rebuilds without clearing vectors", async () => {
     const store = await createStore({
       dbPath: freshDbPath(),
       config: {
@@ -1703,7 +1666,7 @@ describe("embed", () => {
     });
 
     const fakeProvider = createFakeEmbedProvider();
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
+
     store.internal.embeddingProvider = fakeProvider;
 
     const vectorCounts = () => store.internal.db.prepare(`
@@ -1723,16 +1686,14 @@ describe("embed", () => {
         { collection: "notes", count: 3 },
       ]);
 
-      const result = await store.embed({ force: true, collection: "docs" });
-
-      expect(result.docsProcessed).toBe(3);
-      expect(result.chunksEmbedded).toBe(3);
+      const requestsBefore = fakeProvider.embedBatchCalls.length;
+      await expect(store.embed({ force: true, collection: "docs" })).rejects.toThrow("cannot be collection-scoped");
+      expect(fakeProvider.embedBatchCalls).toHaveLength(requestsBefore);
       expect(vectorCounts()).toEqual([
         { collection: "docs", count: 3 },
         { collection: "notes", count: 3 },
       ]);
     } finally {
-      setDefaultLlamaCpp(null);
       await store.close();
     }
   });
@@ -1742,12 +1703,12 @@ describe("embed", () => {
       dbPath: freshDbPath(),
       config: { collections: {} },
     });
+    store.internal.embeddingProvider = createFakeEmbedProvider();
 
     try {
       await expect(store.embed({ maxDocsPerBatch: 0 })).rejects.toThrow("maxDocsPerBatch");
       await expect(store.embed({ maxBatchBytes: 0 })).rejects.toThrow("maxBatchBytes");
     } finally {
-      setDefaultLlamaCpp(null);
       await store.close();
     }
   });

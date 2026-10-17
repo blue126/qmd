@@ -17,16 +17,16 @@ import {
   insertDocument,
   insertEmbedding,
   hashContent,
-  DEFAULT_EMBED_MODEL,
   type Store,
 } from "../src/store.js";
 import {
   beginEmbeddingBuild,
   completeEmbeddingBuild,
-  createEmbeddingIdentity,
 } from "../src/embedding/identity.js";
 import { replaceDocumentMetadata, syncDocumentMetadata } from "../src/metadata-store.js";
 import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "../src/metadata.js";
+import { remoteEmbeddingIdentity } from "../src/embedding/remote-embedding.js";
+import type { EmbeddingProvider } from "../src/embedding/provider.js";
 import type { MetadataFilter } from "../src/metadata-filter.js";
 
 let testDir: string;
@@ -163,17 +163,24 @@ describe("searchFTS with metadata filter", () => {
 });
 
 describe("searchVec with metadata filter", () => {
-  const model = DEFAULT_EMBED_MODEL;
+  const model = "metadata-test-remote";
+  const provider: EmbeddingProvider = {
+    providerId: "test-remote",
+    model,
+    dimension: 3,
+    remote: true,
+    canonicalIdentityMaterial: () => JSON.stringify({ provider: "test-remote", model, dimension: 3 }),
+    formatQuery: query => query,
+    formatDocument: text => text,
+    embed: async () => { throw new Error("Precomputed vector expected"); },
+    embedBatch: async () => { throw new Error("Precomputed vectors expected"); },
+    close: async () => {},
+  };
   const queryEmbedding = [1, 0, 0];
 
   function beginFixture(dimension: number = 3) {
-    const identity = createEmbeddingIdentity({
-      providerId: "local-test",
-      model,
-      dimension,
-      remote: false,
-      canonicalMaterial: JSON.stringify({ provider: "local-test", model, dimension }),
-    });
+    expect(dimension).toBe(provider.dimension);
+    const identity = remoteEmbeddingIdentity(provider);
     const lease = beginEmbeddingBuild(store.db, identity, {
       ownerId: "metadata-search-fixture",
       now: Date.now(),
@@ -212,11 +219,11 @@ describe("searchVec with metadata filter", () => {
     await insertEmbeddedDoc("notes", "far-published.md", "# Far published", [0, 1, 0], { status: "published" }, fixture);
     completeEmbeddingBuild(store.db, fixture.lease);
 
-    const unfiltered = await searchVec(store.db, "q", model, 10, undefined, undefined, queryEmbedding);
+    const unfiltered = await searchVec(store.db, "q", model, 10, undefined, undefined, queryEmbedding, provider);
     expect(unfiltered.map(r => r.displayPath)).toEqual(["notes/close-draft.md", "notes/far-published.md"]);
 
     const filtered = await searchVec(
-      store.db, "q", model, 10, undefined, undefined, queryEmbedding, undefined,
+      store.db, "q", model, 10, undefined, undefined, queryEmbedding, provider,
       { key: "status", operator: "eq", value: "published" },
     );
     expect(filtered.map(r => r.displayPath)).toEqual(["notes/far-published.md"]);
@@ -229,7 +236,7 @@ describe("searchVec with metadata filter", () => {
     completeEmbeddingBuild(store.db, fixture.lease);
 
     const filtered = await searchVec(
-      store.db, "q", model, 10, undefined, undefined, queryEmbedding, undefined,
+      store.db, "q", model, 10, undefined, undefined, queryEmbedding, provider,
       { key: "status", operator: "eq", value: "published" },
     );
     expect(filtered).toEqual([]);
@@ -265,7 +272,7 @@ describe("searchVec with metadata filter", () => {
     completeEmbeddingBuild(store.db, fixture.lease);
 
     const filtered = await searchVec(
-      store.db, "q", model, 10, undefined, undefined, queryEmbedding, undefined,
+      store.db, "q", model, 10, undefined, undefined, queryEmbedding, provider,
       { key: "status", operator: "eq", value: "published" },
     );
     expect(filtered.map(r => r.displayPath)).toEqual(["notes/published-copy.md"]);
@@ -278,7 +285,7 @@ describe("searchVec with metadata filter", () => {
     completeEmbeddingBuild(store.db, fixture.lease);
 
     const filtered = await searchVec(
-      store.db, "q", model, 10, "docs", undefined, queryEmbedding, undefined,
+      store.db, "q", model, 10, "docs", undefined, queryEmbedding, provider,
       { key: "status", operator: "eq", value: "published" },
     );
     expect(filtered.map(r => r.displayPath)).toEqual(["docs/b.md"]);

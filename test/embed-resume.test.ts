@@ -23,6 +23,8 @@ import {
   inspectEmbeddingIndexState,
 } from "../src/embedding/identity.js";
 import type { EmbeddingProvider } from "../src/embedding/provider.js";
+import { OpenAIEmbeddingProvider } from "../src/embedding/openai.js";
+import { remoteEmbeddingIdentity } from "../src/embedding/remote-embedding.js";
 
 const tempDirs: string[] = [];
 
@@ -45,6 +47,15 @@ function identity(model: string, dimension: number) {
       formatter: "test-v1",
       chunking: "test-v1",
     }),
+  });
+}
+
+function remoteQueryProvider(model: string, dimension = 3) {
+  return new OpenAIEmbeddingProvider({
+    apiKey: "test-only-key",
+    model,
+    dimension,
+    fetch: async () => { throw new Error("Precomputed searches must not call the provider"); },
   });
 }
 
@@ -252,9 +263,10 @@ describe("embedding partial resume persistence", () => {
     store.close();
   });
 
-  test("does not search building vectors through the low-level legacy path", async () => {
+  test("does not search building vectors before remote identity publication", async () => {
     const store = await createTempStore();
-    const activeIdentity = identity("active-model", 3);
+    const provider = remoteQueryProvider("active-model");
+    const activeIdentity = remoteEmbeddingIdentity(provider);
     const lease = beginEmbeddingBuild(store.db, activeIdentity, {
       ownerId: "active-owner",
       now: Date.now(),
@@ -285,6 +297,7 @@ describe("embedding partial resume persistence", () => {
       undefined,
       undefined,
       [1, 0, 0],
+      provider,
     )).toEqual([]);
 
     completeEmbeddingBuild(store.db, lease);
@@ -296,13 +309,15 @@ describe("embedding partial resume persistence", () => {
       undefined,
       undefined,
       [1, 0, 0],
+      provider,
     )).toHaveLength(1);
     store.close();
   });
 
   test("keeps a published same-identity generation searchable during incremental work", async () => {
     const store = await createTempStore();
-    const activeIdentity = identity("incremental-model", 3);
+    const provider = remoteQueryProvider("incremental-model");
+    const activeIdentity = remoteEmbeddingIdentity(provider);
     const initialLease = beginEmbeddingBuild(store.db, activeIdentity, {
       ownerId: "initial-owner",
       now: Date.now(),
@@ -341,6 +356,7 @@ describe("embedding partial resume persistence", () => {
       undefined,
       undefined,
       [1, 0, 0],
+      provider,
     )).toHaveLength(1);
     completeEmbeddingBuild(store.db, incrementalLease);
     store.close();
@@ -387,6 +403,7 @@ describe("embedding partial resume persistence", () => {
       undefined,
       undefined,
       [1, 0, 0],
+      remoteQueryProvider("orphan-model"),
     )).toEqual([]);
     store.close();
   });
@@ -396,16 +413,12 @@ describe("embedding partial resume persistence", () => {
       providerId: "replacement-provider",
       model: "replacement-model",
       dimension: 3,
-      remote: false,
+      remote: true,
       canonicalIdentityMaterial: () => JSON.stringify({ provider: "replacement-provider", version: 1 }),
       formatQuery: query => query,
       formatDocument: text => text,
-      embed: async () => ({ vector: [0, 1, 0], model: "replacement-model", dimension: 3 }),
-      embedBatch: async texts => texts.map(() => ({
-        vector: [0, 1, 0],
-        model: "replacement-model",
-        dimension: 3,
-      })),
+      embed: async () => { throw new Error("Identity changes must fail before upload"); },
+      embedBatch: async () => { throw new Error("Identity changes must fail before upload"); },
       close: async () => {},
     };
     const dir = await mkdtemp(join(tmpdir(), "qmd-embed-resume-"));
