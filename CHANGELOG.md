@@ -5,6 +5,7 @@
 ### Changed
 
 - **Remote-only runtime (unpublished review build `2026.10.18-remote.0`)**: Remove local GGUF inference and the `node-llama-cpp` dependency. CLI, MCP, and SDK keep local SQLite/BM25, CJK, AST, collections, reads, and maintenance; embedding, query expansion, and reranking use explicitly configured remote APIs. `qmd pull` now reports retirement and exits unsuccessfully without downloading anything. Existing local-model databases remain available for lexical reads; remote vector use requires an explicit manual rebuild rather than automatic vector conversion or deletion. Package and model regression checks use mocks or loopback HTTP only.
+- **Breaking SDK change:** Retire `LlamaCpp`, local provider owners, default-Llama singleton/session helpers, model pull/GGUF/GPU/tokenizer APIs, and `internal.localLlm`. Use `createStore()` with explicit remote models, or `searchLex()` / explicit model-free query options. Missing expansion or reranking configuration fails clearly rather than silently downgrading retrieval.
 
 - Dependency upgrades and runtime engine modernization: Updated Node.js engine target to `>=24.21.0` (LTS Krypton) and packageManager to `pnpm@12.6.0`. Upgraded dependencies and toolchain including `zod` to `4.6.5`, `@modelcontextprotocol/server` to `2.1.0`, `picomatch` to `4.0.7`, `yaml` to `2.9.1`, `tsx` to `4.23.15`, `oxlint` to `1.85.0`, `vitest` to `4.1.11` (patching security advisory GHSA-82fw-gwwq-j7x9), and refreshed patch/minor dependency overrides.
 

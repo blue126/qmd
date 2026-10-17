@@ -569,6 +569,23 @@ To use remote vectors, configure the desired remote model and run an explicit
 `qmd embed --force` after reviewing the provider and data boundary. This clears
 and rebuilds vectors as a user-requested operation; lexical content is retained.
 
+### Breaking SDK changes
+
+The supported package entry remains `createStore()` with the existing remote
+`config.models` fields. Local-model execution through `embed`, vector search,
+expansion, and reranking is retired: missing remote settings now fail explicitly.
+Model-free callers should use `searchLex()` or explicit lexical queries with
+`rerank: false` and expansion skipped; model-backed queries never silently skip
+required expansion or reranking.
+
+Code importing implementation modules must migrate away from `LlamaCpp`,
+`LlamaCppConfig`, `LocalEmbeddingProvider`, `LocalEmbeddingProviderOwner`,
+`withLLMSession`, the default-Llama singleton helpers, `pullModels`, GGUF/cache
+inspection, GPU helpers, and local tokenization APIs. They are removed, as is
+`store.internal.localLlm`. Shared model types and pure formatting helpers remain
+separate from inference; scoped sessions require an explicit remote owner.
+Existing local identity labels remain diagnostic data, not executable providers.
+
 ### Remote Embedding & Models Configuration (Explicit Opt-in)
 
 Configure remote embeddings and remote LLM models in `index.yml` under the unified `models:` section. Configuration alone sends no requests; embedding builds and model-backed searches are explicit operations.
@@ -648,7 +665,7 @@ qmd embed
 
 > **CLI, SDK & MCP Integration:** Remote LLM query expansion and LLM Chat Reranking are automatically wired into CLI (`qmd query`), SDK (`createStore`), and MCP. Query expansion automatically enforces query language & script consistency (e.g., Traditional Chinese queries generate Traditional Chinese `lex`, `vec`, and `hyde` variations). LLM Chat Reranking features prompt-tail Recency Enforcement and strict JSON sanitization to ensure safe execution with any remote LLM backend.
 
-`qmd init` writes local defaults only; it does not prompt for or generate a remote embedding configuration. To use a remote endpoint, edit `index.yml` manually and set credentials when required.
+`qmd init` writes index and collection defaults only; it does not prompt for or generate model configuration. To use a remote endpoint, edit `index.yml` manually and set credentials when required.
 
 > **API Key Note:** Remote embeddings require both an embedding endpoint (`embed_url`, `embed_base_url`, or `embed_api_url`) and `embed_api_model` (unless `embed_provider: voyageai` supplies the Voyage default model/URL). Official OpenAI needs `OPENAI_API_KEY`; official Voyage needs `VOYAGE_API_KEY`. Custom OpenAI-compatible proxies may omit a key when the upstream is keyless. For Voyage-shaped traffic through a custom proxy only, `OPENAI_API_KEY` may fill in when `VOYAGE_API_KEY` is unset — never for `https://api.voyageai.com/v1`. QMD never writes keys to SQLite, diagnostics, logs, or error messages.
 
@@ -941,7 +958,8 @@ collections:
 
 > **Note:** Editing `index.yml` changes which directories and models QMD *uses*,
 > but does not re-index on its own. Run `qmd update` after changing `path`,
-> `pattern`, or `ignore`, and `qmd embed` after changing `models.embed`.
+> `pattern`, or `ignore`. Changing remote embedding identity requires the explicit
+> whole-index rebuild described above; legacy `models.embed` no longer enables inference.
 
 #### Automatic update commands
 
