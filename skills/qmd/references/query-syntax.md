@@ -1,6 +1,9 @@
 # QMD Query Syntax Reference
 
-QMD queries are structured documents composed of typed sub-queries. Each line specifies a search type and query text. The hybrid retrieval engine combines results via Reciprocal Rank Fusion (RRF) and reranks them.
+QMD accepts plain queries or structured documents of typed sub-queries. The hybrid
+engine fuses results via Reciprocal Rank Fusion (RRF) and reranks them by default.
+Expansion, embedding, and reranking use explicitly configured remote APIs; no
+local inference or automatic model download is available.
 
 ## Grammar
 
@@ -23,15 +26,15 @@ newline        = "\n" ;
 | Type | Method | Best For | Description |
 |------|--------|----------|-------------|
 | `lex` | BM25 (FTS5) | Exact terms, identifiers, code, titles | Keyword search with prefix, phrase, and negation support |
-| `vec` | Vector | Natural language concepts | Semantic similarity search using local/remote embeddings |
-| `hyde` | Vector | Complex conceptual questions | Hypothetical Document Embedding (generate expected passage) |
+| `vec` | Vector | Natural language concepts | Semantic similarity search using remote embeddings and a compatible vector index |
+| `hyde` | Vector | Complex conceptual questions | Embed the hypothetical passage supplied by the caller through the remote embedding provider |
 
 ## Default Policy & Expansion Behavior
 
 A query is either a single policy query or a multi-line query document:
-- **`auto` (Default)**: CJK queries and strong lexical matches automatically bypass model expansion. Other plain queries expand into `lex`, `vec`, and `hyde` variants.
+- **`auto` (Default)**: Strong lexical matches can bypass expansion. CJK skips expansion when no expansion-capable service is configured; with one configured, CJK can expand. Relative temporal terms and supplied expansion/rerank context prevent the strong-match shortcut. Other plain queries require remote expansion into typed variants.
 - **`expand:` / `--expand` (`force`)**: Explicitly forces expansion even if bypass heuristics apply.
-- **`lex:` (`skip`)**: Explicitly disables expansion and performs direct BM25 search.
+- **`lex:` (`skip`)**: Disables expansion. CLI typed `lex:` queries perform lexical retrieval; the MCP plain-query path can still retrieve vectors from an available index. Use explicit typed searches for a strictly lexical MCP request.
 
 ```bash
 # Automatic policy:
@@ -41,9 +44,14 @@ qmd query "how does authentication work"
 qmd query "expand: how does authentication work"
 # or: qmd query --expand "資料庫同步"
 
-# Explicitly skip expansion:
-qmd query "lex: authentication"
+# Explicitly lexical, without remote reranking:
+qmd query --no-rerank "lex: authentication"
 ```
+
+Skipping expansion does not disable reranking. `qmd search` is the simplest
+model-free CLI path. For MCP, use `searches` containing only `lex` entries and
+`rerank: false`. Plain `query` with `expansion: "skip"` alone is not an offline
+guarantee. Missing required remote settings produce an error, not a local fallback.
 
 ## Lexical Search Syntax (`lex:`)
 
@@ -83,7 +91,10 @@ hyde: The rate limiter uses a sliding window counter algorithm with a 60-second 
 
 ## Multi-Line Structured Queries
 
-Combine multiple sub-query types for optimal retrieval. The first sub-query receives **2x weight** during Reciprocal Rank Fusion:
+Combine query types when the required remote services are available. The first
+sub-query receives **2x weight** during Reciprocal Rank Fusion. Typed queries
+bypass automatic expansion; `vec`/`hyde` still require remote embedding and a
+compatible index, and reranking remains enabled unless explicitly disabled:
 
 ```
 lex: rate limiter algorithm
@@ -118,6 +129,20 @@ qmd query -c docs -c notes $'lex: auth\nvec: authentication flow'
 ## MCP Tool Call Payloads
 
 When calling the `qmd` MCP server's `query` tool, provide a structured `searches` array:
+
+### Model-Free Lexical Query
+
+```json
+{
+  "searches": [{ "type": "lex", "query": "CAP theorem" }],
+  "collections": ["docs"],
+  "limit": 10,
+  "rerank": false
+}
+```
+
+Use either `query` or `searches`, never both. The examples below require the
+remote services used by their retrieval, expansion, and reranking stages.
 
 ### Standard Multi-Modal Query
 

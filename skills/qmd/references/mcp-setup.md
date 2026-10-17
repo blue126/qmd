@@ -1,12 +1,23 @@
 # QMD MCP Server Setup
 
-## Install
+## Install and prepare collections
+
+Perform installation, indexing, or server startup only when the user requests
+setup. Node.js >=24.21.0 is required. BM25 and document reads need no model settings:
 
 ```bash
-npm install -g @wei840222/qmd
+pnpm add -g @wei840222/qmd
 qmd collection add ~/path/to/markdown --name myknowledge
-qmd embed
+qmd search "keyword phrases" -c myknowledge
 ```
+
+For semantic search, first configure remote models as described in
+[SKILL.md](../SKILL.md#models--remote-endpoint-configuration). Embedding builds
+send document content, expansion sends queries/context, and reranking sends
+candidate passages to the chosen providers. Run `qmd embed` only after that use
+is authorized. Old local-model indexes remain readable lexically; conversion to
+remote vectors requires an explicitly requested `qmd embed --force`, which clears
+and rebuilds vectors. No local model, GPU setup, download, or `qmd pull` is needed.
 
 ## Configure MCP Client
 
@@ -22,6 +33,12 @@ Add QMD to your MCP client configuration (e.g. Cursor, Claude Desktop, Zed, Open
   }
 }
 ```
+
+The MCP process must read the intended QMD configuration and inherit the required
+embedding credentials (`OPENAI_API_KEY` or `VOYAGE_API_KEY`, depending on provider).
+Use private client configuration or the launch environment; never commit keys.
+Authenticated expansion and reranking use their own private QMD configuration
+fields, `models.generate_api_key` and `models.rerank_api_key`.
 
 ## Protocol
 
@@ -52,7 +69,19 @@ There is no session GET stream and no idle-session TTL.
 
 ### query
 
-Search with pre-expanded queries.
+Use either a plain `query` with an expansion policy, or caller-authored
+`searches`. Do not supply both. For model-free lexical retrieval:
+
+```json
+{
+  "searches": [{ "type": "lex", "query": "keyword phrases" }],
+  "collections": ["myknowledge"],
+  "limit": 10,
+  "rerank": false
+}
+```
+
+With remote embedding and reranking configured and a compatible vector index:
 
 ```json
 {
@@ -62,7 +91,7 @@ Search with pre-expanded queries.
     { "type": "hyde", "query": "hypothetical answer passage..." }
   ],
   "limit": 10,
-  "collection": "optional",
+  "collections": ["myknowledge"],
   "minScore": 0.0
 }
 ```
@@ -73,15 +102,20 @@ Search with pre-expanded queries.
 | `vec` | Vector | Question |
 | `hyde` | Vector | Answer passage (50-100 words) |
 
+Reranking defaults to enabled, including for typed lexical searches. Set
+`rerank: false` to disable that remote stage. `expansion: "skip"` only skips
+expansion; a plain query may still embed against an existing vector index.
+
 ### get
 
 Retrieve document by path or `#docid`.
 
 | Param | Type | Description |
 |-------|------|-------------|
-| `path` | string | File path or `#docid` |
-| `full` | bool? | Return full content |
-| `lineNumbers` | bool? | Add line numbers |
+| `file` | string | Path or `#docid`; supports `:from:count` suffixes |
+| `fromLine` | number? | First line, 1-indexed; overrides suffix start |
+| `maxLines` | number? | Maximum lines; overrides suffix count |
+| `lineNumbers` | bool? | Add line numbers (default true) |
 
 ### multi_get
 
@@ -90,7 +124,9 @@ Retrieve multiple documents.
 | Param | Type | Description |
 |-------|------|-------------|
 | `pattern` | string | Glob or comma-separated list |
+| `maxLines` | number? | Maximum lines per file |
 | `maxBytes` | number? | Skip large files (default 64KB) |
+| `lineNumbers` | bool? | Add line numbers (default true) |
 
 ### status
 
@@ -98,6 +134,13 @@ Index health and collections. No params.
 
 ## Troubleshooting
 
-- **Not starting**: `which qmd`, `qmd mcp` manually
-- **No results**: `qmd collection list`, `qmd embed`
-- **Slow first search**: Normal, models loading (~3GB)
+- **Not starting**: Check `command -v qmd`, Node version, and the MCP process's
+  environment/config access. Start `qmd mcp` manually only as part of requested setup.
+- **No lexical results**: Check `qmd collection list`, collection filters, and query
+  terms. An embedding build does not repair missing lexical documents.
+- **Remote model/configuration error**: Run `qmd doctor`. Missing credentials,
+  endpoints, or matching vectors require explicit configuration or maintenance;
+  use a lexical-only request rather than downloading models or silently rebuilding.
+- **Slow search**: Compare a lexical-only request with the model-backed request.
+  Inspect remote provider latency and index diagnostics; this build never loads
+  a multi-GB local inference model.

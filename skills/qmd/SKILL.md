@@ -2,10 +2,10 @@
 name: qmd
 description: Search local markdown knowledge bases, notes, docs, and wikis with QMD. Use when users ask to find notes, retrieve documents, inspect a wiki, answer from indexed markdown, or set up QMD access.
 license: MIT
-compatibility: Requires qmd CLI or MCP server. Install via `npm install -g @wei840222/qmd`.
+compatibility: Requires Node.js >=24.21.0 and qmd CLI or MCP server. Model-backed operations require explicitly configured remote APIs.
 metadata:
   author: wei840222
-  version: 2026.8.23-1
+  version: "2026.10.19"
 allowed-tools: Bash(qmd:*), mcp__qmd__*
 ---
 
@@ -16,6 +16,18 @@ allowed-tools: Bash(qmd:*), mcp__qmd__*
 QMD searches local markdown collections: notes, docs, wikis, transcripts, and
 project knowledge bases. Use it before web search when the answer may already be
 in indexed local files.
+
+BM25, Chinese segmentation, AST chunking, document reads, collections, and
+maintenance run locally without model settings. Local inference, model downloads,
+GPU setup, and fine-tuning tools are retired. `qmd pull` exits nonzero and never
+downloads models.
+
+Start with `qmd search` when model configuration or permission to use a remote
+provider is unknown. Semantic retrieval needs remote embeddings and a compatible
+vector index; automatic expansion and enabled reranking need their own remote
+settings. Expansion sends queries/context, embedding builds send document
+content, and reranking sends candidate passages to the configured providers.
+Do not enable providers or rebuild vectors merely to answer a search request.
 
 The workflow is always:
 
@@ -34,13 +46,10 @@ qmd search "merchant reality support interviews" -n 5
 qmd multi-get "#abc123,#def432" --format md
 ```
 
-**Default to structured `qmd query` with `intent:`, `lex:`, `vec:`, and `hyde:`
-fields that you write yourself.** You are a better query expander than the
-built-in model: you know the user's actual goal, the domain vocabulary, and the
-nearby-but-wrong concepts to avoid. Do not just paste the user's words into
-`qmd query "..."` and hope the expansion model guesses right — supply the
-`intent:` and craft the lexical and semantic terms deliberately (see
-[Pick the right search mode](#pick-the-right-search-mode)).
+When remote search is configured and appropriate, use structured `qmd query`
+with exact lexical anchors and semantic paraphrases. Add `intent:` when the
+request is ambiguous; typed fields bypass automatic expansion. See
+[Pick the right search mode](#pick-the-right-search-mode).
 
 When reporting what you retrieved, a compact note is enough; do not paste whole
 files unless needed:
@@ -63,37 +72,39 @@ qmd search '"AI Before Headcount"' -c concepts -n 5
 
 Use **`qmd query` with structured fields** when the user describes an idea
 indirectly, uses different wording than the source, or needs conceptual recall.
-**This is the default mode — write the fields yourself rather than leaning on
-query expansion.** Combine exact anchors with semantic recall:
+Use this after confirming the required remote models and index are available.
+Combine exact anchors with semantic recall:
 
 ```bash
 qmd query $'intent: Find the concept note about metrics as instruments without letting OKRs replace judgment.\nlex: cockpit instruments OKR Goodhart metrics judgment\nvec: data informed not metric driven product judgment\nhyde: A concept note says metrics are useful like cockpit instruments, but leaders should remain data-informed rather than metric-driven because OKRs and dashboards can Goodhart product judgment.'
 ```
 
-Structured query fields (you author each one — do not delegate this to the
-expansion model):
+Structured query fields:
 
-- `intent:` states what you are trying to find **and what to avoid**. Always
-  supply this. It steers ranking away from nearby-but-wrong concepts.
+- `intent:` optionally states what you are trying to find **and what to avoid**.
+  It steers ranking away from nearby-but-wrong concepts.
 - `lex:` exact terms, aliases, titles, code symbols, and rare words you expect
   in the source. This is your own keyword expansion.
 - `vec:` paraphrases the idea in natural language, in source-like wording.
 - `hyde:` describes the document or answer that would satisfy the request.
 
-You do not need all four every time, but you should almost always write at least
-`intent:` plus one of `lex:`/`vec:`. A bare `qmd query "the user's sentence"`
-throws away the context only you have and relies on the built-in expander to
-reconstruct it — prefer the structured form.
+Use only the fields that help the request. A plain `qmd query "..."` follows the
+expansion policy; it may call remote expansion, embedding, and reranking services.
+Typed `vec:` and `hyde:` queries require remote embeddings; typed `lex:` does
+not. Reranking is enabled by default even for a lexical structured query.
 
-If you genuinely have nothing to expand (a single rare token, a verbatim phrase),
-that is a job for `qmd search`, not bare `qmd query`:
+For a single rare token or a verbatim phrase, prefer `qmd search`. To inspect
+structured ranking, use `--explain`; for model-free structured lexical search,
+also disable reranking:
 
 ```bash
 qmd query --format json --explain $'intent: ...\nlex: ...\nvec: ...'  # inspect ranking
+qmd query --no-rerank 'lex: authentication'                       # lexical only
 ```
 
-If `qmd query` is slow or remote model configuration fails, fall back to `qmd search` with
-better lexical terms.
+If a required remote provider is missing or fails, QMD reports an error rather
+than using a local model or silently dropping that stage. Use `qmd search` with
+better lexical terms as an explicit alternative and disclose the narrower search.
 
 ## Retrieve sources
 
@@ -184,22 +195,25 @@ output will start at `line`).
 
 ## Discover what is indexed
 
-Run `qmd status` or `qmd ls` to quickly discover available collections, indexed file counts, and model readiness (all run in sub-seconds):
+Run `qmd status`, `qmd collection list`, or `qmd ls` to inspect collections and
+document counts. Use `qmd doctor` for remote configuration and index diagnostics:
 
 ```bash
-qmd status            # check collection overview, document counts, and model health
+qmd status            # collection overview, document counts, configured models
 qmd collection list   # list registered collection paths
 qmd ls                # list collection virtual paths
+qmd doctor            # diagnose without model requests
 ```
 
-Always use collection filters (`-c <name>`) when searching specific topics to prevent cross-corpus drift and ensure fast, accurate results:
+Use collection filters (`-c <name>`) when the relevant collection is known:
 
 ```bash
 qmd search "headcount autonomous agents" -c concepts -n 10
 qmd query "merchant support product reality" -c concepts -c sources -n 10
 ```
 
-> **Performance Tip for Agents:** Collection filters (`-c`) are natively indexed in both lexical and vector virtual tables. Scoping by collection guarantees millisecond search latency and avoids ranking dilution from unrelated collections. Omit `-c` only when searching across the entire workspace.
+Collection filters narrow the search scope. Latency still depends on the index,
+query, and remote services; do not promise a fixed response time.
 
 ## Filter by metadata
 
@@ -215,6 +229,19 @@ Nodes are discriminated by `operator`: groups `and`/`or` take `operands`, `not` 
 ## MCP Tool: `query`
 
 When using the MCP server, prefer structured searches:
+
+For offline BM25, send only `lex` searches and explicitly set `rerank: false`:
+
+```json
+{
+  "searches": [{ "type": "lex", "query": "cockpit OKR Goodhart" }],
+  "collections": ["concepts"],
+  "limit": 10,
+  "rerank": false
+}
+```
+
+When remote embeddings and reranking are configured, combine query types:
 
 ```json
 {
@@ -270,10 +297,10 @@ Only mutate indexes when the user asked for setup or maintenance. Searching and
 retrieving are safe; collection/index mutation is not a casual first step.
 
 ```bash
-npm install -g @wei840222/qmd
+pnpm add -g @wei840222/qmd
 qmd collection add ~/notes --name notes
 qmd update
-qmd embed
+qmd search "authentication" -c notes
 ```
 
 ### Models & Remote Endpoint Configuration
@@ -288,21 +315,34 @@ models:
 
   # Optional: Remote LLM Query Expansion (aliases: generate_url, generate_base_url, generate_api_url)
   generate_api_url: https://api.example.com/v1 # Base URL (appends /chat/completions) or full endpoint
-  generate_api_model: qwen3-7b-instruct # or your-model-name
+  generate_api_model: your-expansion-model
 
   # Optional: Remote Reranking (supports rerank_url / rerank_base_url / rerank_api_url)
-  rerank_api_url: https://api.example.com/v1/chat/completions # Supports both /v1/rerank and /v1/chat/completions LLM endpoints
-  rerank_api_model: bge-reranker-v2-m3 # or gpt-4o-mini / qwen3-7b-instruct
+  rerank_api_url: https://your-reranker.example/v1/rerank
+  rerank_api_model: your-reranker
 
 # Optional: Custom User Dictionary for CJK segmentation
 dictionary: ~/.config/qmd/dictionary.txt
 ```
 
-> **Smart URL Resolution & Reranker Endpoints:** Remote LLM URLs support `_url`, `_base_url`, and `_api_url` aliases. Given a Base URL (e.g. `https://api.example.com/v1`), QMD automatically appends `/chat/completions` or `/rerank`. Explicit endpoint URLs are preserved as-is. For reranking, QMD supports both dedicated Cross-Encoder endpoints (`/v1/rerank`) and general LLM endpoints (`/v1/chat/completions`) with strict JSON sanitization and prompt-tail Recency Enforcement.
+Remote URLs support `_url`, `_base_url`, and `_api_url` aliases. A base URL gets
+`/chat/completions` for expansion or `/rerank` for reranking. Use a dedicated
+reranker model with `/rerank`, or a chat-capable model with an explicit
+`/chat/completions` endpoint; do not interchange those model types.
 
-> **CLI & MCP Integration:** Remote LLM query expansion and LLM Chat Reranking are automatically wired into CLI (`qmd query`) and MCP. Query expansion automatically maintains language & script consistency matching the user query (e.g. Traditional Chinese queries produce Traditional Chinese `lex`, `vec`, and `hyde` variations).
->
-> **Batch Embedding & Vector Indexing:** Embedding requests for both indexing and query expansion automatically use high-throughput Batch APIs with graceful per-item fallback. Vector search leverages native collection pre-filtering for sub-second query latency across large datasets.
+Official OpenAI embeddings require `OPENAI_API_KEY`; official Voyage embeddings
+require `VOYAGE_API_KEY`. For authenticated expansion/reranking, configure
+`models.generate_api_key` / `models.rerank_api_key` in private configuration.
+`OPENAI_API_KEY` does not automatically fill those two fields. Never commit keys
+or assume that YAML interpolates environment variables. The MCP subprocess must
+receive the required environment and be able to read the intended QMD config.
+
+After the user authorizes sending indexed documents to the configured embedding
+provider, run `qmd embed` for a compatible index. Existing local-model indexes
+remain usable for lexical search and reads. Switching embedding identity requires
+an explicitly requested `qmd embed --force`, which clears and rebuilds vectors
+while retaining lexical content. Do not mix identities, delete the database,
+change models automatically, or attempt local inference as recovery.
 
 Health and diagnostics:
 
@@ -324,9 +364,9 @@ server configuration.
 - **Do not slice files with `sed`/`head`/`tail`.** Use the `path:from:count`
   suffix (e.g. `qmd get "#abc123:120:40"`) or `--from`/`-l`. Output is already
   line-numbered; piping breaks docid resolution, the header, and virtual paths.
-- **Do not lean on query expansion.** Write `intent:`/`lex:`/`vec:`/`hyde:`
-  yourself. A bare `qmd query "user sentence"` discards the context only you
-  have. You expand the query; the model just ranks.
+- **Choose remote search deliberately.** Typed queries skip expansion, but
+  `vec:`/`hyde:` still need remote embeddings and reranking defaults to enabled.
+  Skipping expansion alone does not make a query model-free.
 - **Do not overuse semantic search.** If you know exact titles or terms, BM25 is
   faster and often better.
 - **Do not mutate indexes casually.** `qmd collection add`, `qmd update`, and
@@ -341,6 +381,6 @@ server configuration.
   project documentation.
 
 Local model inference and `qmd pull` are retired in remote-only builds. Existing
-local-model databases remain available for lexical reads. Rebuilding them for a
-remote provider requires the user to explicitly request `qmd embed --force`; do
-not auto-convert, clear vectors, download models, or make hidden remote requests.
+local-model databases remain available for lexical reads. Training datasets,
+fine-tuning/conversion scripts, and GPU/Bun container smoke tools are also removed;
+do not recommend them for setup or troubleshooting.
