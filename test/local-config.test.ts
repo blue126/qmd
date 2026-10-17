@@ -92,9 +92,10 @@ describe("local .qmd project config", () => {
     const localIndex = join(root, ".qmd", "index.sqlite");
     expect(output).toContain(`Index: ${realpathSync(localIndex)}`);
     expect(output).toContain("docs (qmd://docs/)");
-    expect(output).toContain("Embedding:   local-embed-model");
-    expect(output).toContain("Reranking:   local-rerank-model");
-    expect(output).toContain("Generation:  local-generate-model");
+    expect(output).toContain("Model:    local-embed-model");
+    expect(output).toContain("Embedding:   not configured (local inference retired)");
+    expect(output).toContain("Reranking:   not configured");
+    expect(output).toContain("Generation:  not configured");
     expect(output).not.toContain("env-embed-model");
     expect(existsSync(localIndex)).toBe(true);
     expect(existsSync(join(home, ".cache", "qmd", "index.sqlite"))).toBe(false);

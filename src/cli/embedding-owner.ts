@@ -1,9 +1,6 @@
-import { LocalEmbeddingProviderOwner } from "../embedding/local.js";
 import { CompositeEmbeddingProviderOwner } from "../embedding/owner.js";
 import type { EmbeddingProvider, EmbeddingProviderOwner } from "../embedding/provider.js";
-import { waitForLLMSessionsToDrain } from "../llm.js";
-
-type LocalEmbeddingRuntime = ConstructorParameters<typeof LocalEmbeddingProviderOwner>[0];
+import { waitForLLMSessionsToDrain, type LLM } from "../llm.js";
 
 export interface CliEmbeddingProviderConfig {
   provider: "local" | "openai" | "voyageai";
@@ -13,17 +10,11 @@ export interface CliEmbeddingProviderConfig {
 
 export function createCliEmbeddingProviderOwner(
   config: CliEmbeddingProviderConfig,
-  runtime: LocalEmbeddingRuntime,
+  runtime: LLM,
   remoteProvider?: EmbeddingProvider,
 ): EmbeddingProviderOwner {
-  if (config.provider === "local") {
-    return new LocalEmbeddingProviderOwner(runtime, {
-      model: config.model,
-      ...(config.dimension == null ? {} : { dimension: config.dimension }),
-    });
-  }
   if (!remoteProvider?.remote) {
-    throw new Error(`${config.provider} CLI composition requires a remote embedding provider.`);
+    throw new Error("Local model inference is retired. Configure a remote embedding provider and explicitly rebuild with qmd embed --force.");
   }
   return new CompositeEmbeddingProviderOwner(remoteProvider, {
     dispose: async () => {

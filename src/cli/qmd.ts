@@ -33,7 +33,6 @@ import {
   extractTitle,
   formatDocForEmbedding,
   getEmbeddingFingerprint,
-  chunkDocumentByTokens,
   clearCache,
   getCacheKey,
   getCachedResult,
@@ -90,11 +89,9 @@ import {
 import { syncDocumentMetadata, countDocumentsPendingMetadata, getDocumentsPendingMetadata } from "../metadata-store.js";
 import type { DocumentMetadata } from "../metadata.js";
 import { parseMetadataFilter, type MetadataFilter } from "../metadata-filter.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { withLLMSessionForLlm, resolveModels } from "../llm.js";
 import { rebuildCjkLexicalIndex } from "../search/cjk-index.js";
-import { RemoteLLM } from "../remote-llm.js";
-import { Hybrid } from "../hybrid.js";
-import { RemoteJev } from "../remote-jev.js";
+import { createConfiguredLLM } from "../hybrid.js";
 import type { ExpansionMode } from "../search/query-expansion.js";
 import {
   EmbeddingConfigError,
@@ -102,7 +99,6 @@ import {
   readCanonicalEmbeddingConfig,
   resolveEmbeddingConfig,
   resolveVoyageApiKey,
-  writeCanonicalEmbeddingConfig,
 } from "../embedding/config.js";
 import {
   OpenAIEmbeddingProvider,
@@ -112,6 +108,7 @@ import {
   VoyageEmbeddingProvider,
   UnavailableVoyageEmbeddingProvider,
 } from "../embedding/voyage.js";
+import { UnavailableLocalEmbeddingProvider } from "../embedding/local.js";
 import type { EmbeddingProviderOwner } from "../embedding/provider.js";
 import { createCliEmbeddingProviderOwner } from "./embedding-owner.js";
 import { readStoredEmbeddingIdentity } from "../embedding/identity.js";
@@ -186,12 +183,13 @@ let currentIndexName = "index";
 function getStore(): ReturnType<typeof createStore> {
   if (!store) {
     store = createStore(storeDbPathOverride);
-    let cliLlama: LlamaCpp | undefined;
     const config = loadConfig();
+    const cliLlm = createConfiguredLLM(config.models);
+    store.llm = cliLlm;
     try {
       syncConfigToDb(store.db, config);
       const dbEmbeddingConfig = readCanonicalEmbeddingConfig(store.db);
-      const activeModels = ensureModelsConfiguredForCli();
+      const activeModels = resolveModelsForCli();
       const configTrusted = localConfigIsFullyTrusted();
       const modelsForLlm = configTrusted ? activeModels : resolveModels();
       const configuredCacheDir = resolveEmbeddingCacheDir(config);
@@ -204,15 +202,6 @@ function getStore(): ReturnType<typeof createStore> {
         env: process.env,
         defaultLocalModel: modelsForLlm.embed,
       });
-      writeCanonicalEmbeddingConfig(store.db, embedding.canonical);
-      cliLlama = new LlamaCpp({
-        embedModel: embedding.canonical.provider === "local"
-          ? embedding.canonical.model
-          : modelsForLlm.embed,
-        generateModel: modelsForLlm.generate,
-        rerankModel: modelsForLlm.rerank,
-      });
-      setDefaultLlamaCpp(cliLlama);
       if (embedding.canonical.provider === "voyageai") {
         const apiKey = resolveVoyageApiKey({
           configApiKey: config?.models?.embed_api_key,
@@ -254,7 +243,7 @@ function getStore(): ReturnType<typeof createStore> {
           : new UnavailableVoyageEmbeddingProvider({ model: configuredModel, dimension: configuredDimension, baseUrl: configuredBaseUrl });
         cliEmbeddingOwner = createCliEmbeddingProviderOwner(
           embedding.canonical,
-          cliLlama,
+          cliLlm,
           provider,
         );
         store.embeddingProvider = provider;
@@ -309,7 +298,7 @@ function getStore(): ReturnType<typeof createStore> {
           : new UnavailableOpenAIEmbeddingProvider({ model: configuredModel, dimension: configuredDimension, baseUrl: configuredBaseUrl });
         cliEmbeddingOwner = createCliEmbeddingProviderOwner(
           embedding.canonical,
-          cliLlama,
+          cliLlm,
           provider,
         );
         store.embeddingProvider = provider;
@@ -325,47 +314,16 @@ function getStore(): ReturnType<typeof createStore> {
           authorizeRemoteEmbeddingRequest(store!.db, identity, "capability-probe");
         };
       } else {
-        cliEmbeddingOwner = createCliEmbeddingProviderOwner(embedding.canonical, cliLlama);
-        store.embeddingProvider = cliEmbeddingOwner.provider;
+        store.embeddingProvider = new UnavailableLocalEmbeddingProvider({
+          model: embedding.canonical.model,
+          dimension: embedding.canonical.dimension ?? undefined,
+        });
       }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
 
-    const rawGenerateUrl = config?.models?.generate_url ?? config?.models?.generate_base_url ?? config?.models?.generate_api_url;
-    const rawRerankUrl = config?.models?.rerank_url ?? config?.models?.rerank_base_url ?? config?.models?.rerank_api_url;
-    const hasRemoteLLM = Boolean(rawGenerateUrl || rawRerankUrl);
 
-    const remoteLlm = hasRemoteLLM
-      ? new RemoteLLM({
-          generateUrl: config?.models?.generate_url,
-          generateBaseUrl: config?.models?.generate_base_url,
-          generateApiUrl: config?.models?.generate_api_url,
-          generateApiModel: config?.models?.generate_api_model,
-          generateApiKey: config?.models?.generate_api_key,
-          rerankUrl: config?.models?.rerank_url,
-          rerankBaseUrl: config?.models?.rerank_base_url,
-          rerankApiUrl: config?.models?.rerank_api_url,
-          rerankApiModel: config?.models?.rerank_api_model,
-          rerankApiKey: config?.models?.rerank_api_key,
-        })
-      : undefined;
-
-    const jevApiKey = config?.models?.jev_api_key?.trim() || process.env.TYPESAFE_API_KEY?.trim();
-    const jevBaseUrl = config?.models?.jev_base_url?.trim() || process.env.TYPESAFE_BASE_URL?.trim();
-    const jevModel = config?.models?.jev_api_model?.trim() || process.env.TYPESAFE_DEFAULT_MODEL?.trim() || "jev-1.13";
-    const remoteJev = jevApiKey
-      ? new RemoteJev({
-          apiKey: jevApiKey,
-          baseUrl: jevBaseUrl,
-          model: jevModel,
-          timeoutMs: 30000,
-        })
-      : undefined;
-
-    if (cliLlama) {
-      store.llm = (remoteLlm || remoteJev) ? new Hybrid(cliLlama, remoteLlm, remoteJev) : cliLlama;
-    }
   }
   return store;
 }
@@ -397,7 +355,7 @@ function resyncConfig(): void {
 function closeDb(): void {
   // A provider owner may still have queued work that depends on this store.
   // The common CLI cleanup closes provider/runtime before closing the database.
-  if (cliEmbeddingOwner) return;
+  if (cliEmbeddingOwner || store?.llm) return;
   if (store) {
     store.close();
     store = null;
@@ -433,7 +391,7 @@ export function createCliResourceCloser(options: CliResourceCloserOptions): () =
 const closeCliResources = createCliResourceCloser({
   getOwner: () => cliEmbeddingOwner,
   clearOwner: () => { cliEmbeddingOwner = null; },
-  disposeFallback: disposeDefaultLlamaCpp,
+  disposeFallback: async () => { await store?.llm?.dispose(); },
   closeStore: () => {
     if (store) {
       store.close();
@@ -524,37 +482,14 @@ async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
   });
 }
 
-/**
- * Finish a successful CLI command after output has been flushed.
- *
- * We deliberately do NOT call `process.exit(0)`. `process.exit()` skips
- * Node's `beforeExit` event, and node-llama-cpp registers a `beforeExit` hook
- * that auto-disposes its native handles. On darwin, without that hook firing,
- * libggml-metal's static `ggml_metal_device` destructor asserts on a
- * non-empty residency-set collection during `__cxa_finalize_ranges` and
- * dumps a multi-kB backtrace (upstream ggml-org/llama.cpp#22593, fix open as
- * PR #22595). Empirically, even with explicit `disposeDefaultLlamaCpp()` the
- * direct `process.exit(0)` path still trips the assertion — letting the
- * event loop drain naturally is what actually clears the rsets.
- *
- * So: set `process.exitCode = 0` and return. The main module finishes, the
- * event loop drains, `beforeExit` fires, native resources tear down in
- * order, and the process exits cleanly. The `GGML_METAL_NO_RESIDENCY=1` env
- * var that `bin/qmd` exports is a defense-in-depth safety net for paths
- * that still call `process.exit()` after loading the native binding
- * (signal handlers, error paths, test runners).
- *
- * If the caller passes an explicit `exit` for testability, we honor it —
- * the lifecycle tests verify the legacy flush → cleanup → exit ordering.
- * Production callers must not pass `exit`.
- */
+/** Flush output, release owned resources, and let the Node event loop drain. */
 export async function finishSuccessfulCliCommand(options: FinishSuccessfulCliCommandOptions): Promise<void> {
   const stderr = options.stderr ?? process.stderr;
 
   await flushWritable(options.stdout ?? process.stdout);
 
   try {
-    await (options.cleanup ?? disposeDefaultLlamaCpp)();
+    await options.cleanup?.();
   } catch (error) {
     stderr.write(
       `QMD Warning: cleanup after successful output failed (${error instanceof Error ? error.message : String(error)}); exiting 0 because command output completed.\n`
@@ -707,10 +642,7 @@ function initLocalIndex(): void {
   if (!existsSync(configPath)) {
     saveConfig({
       collections: {},
-      models: resolveModels(),
     });
-  } else {
-    ensureModelsConfiguredForCli();
   }
 
   const localStore = createStore(dbPath);
@@ -718,27 +650,6 @@ function initLocalIndex(): void {
   localStore.close();
 
   console.log("ready to go with new local index");
-}
-
-function isForceCpuEnabled(): boolean {
-  const value = process.env.QMD_FORCE_CPU;
-  return !!value && !["false", "off", "none", "disable", "disabled", "0"].includes(value.trim().toLowerCase());
-}
-
-function configuredGpuModeLabel(): string {
-  return isForceCpuEnabled()
-    ? "CPU forced (QMD_FORCE_CPU)"
-    : (process.env.QMD_LLAMA_GPU?.trim() || "auto");
-}
-
-function summarizeDeviceNames(names: string[]): string {
-  const counts = new Map<string, number>();
-  for (const name of names) {
-    counts.set(name, (counts.get(name) || 0) + 1);
-  }
-  return Array.from(counts.entries())
-    .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
-    .join(", ");
 }
 
 function sanitizeDiagnosticMessage(message: string): string {
@@ -976,19 +887,13 @@ async function showStatus(): Promise<void> {
 
   // Models
   {
-    // hf:org/repo/file.gguf → https://huggingface.co/org/repo
-    const hfLink = (uri: string) => {
-      const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
-      return match ? `https://huggingface.co/${match[1]}` : uri;
-    };
-    const activeModels = {
-      ...resolveModels(statusConfig.models),
-      embed: statusEmbedding.model,
-    };
+    const activeModels = resolveModels(statusConfig.models);
+    const remoteRoles = createConfiguredLLM(statusConfig.models);
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(activeModels.embed)}`);
-    console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
-    console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
+    console.log(`  Embedding:   ${statusEmbedding.provider === "local" ? "not configured (local inference retired)" : statusEmbedding.model}`);
+    console.log(`  Reranking:   ${remoteRoles.supportsRerank ? remoteRoles.rerankModelName ?? activeModels.rerank : "not configured"}`);
+    console.log(`  Generation:  ${remoteRoles.supportsExpand ? remoteRoles.generateModelName ?? activeModels.generate : "not configured"}`);
+    await remoteRoles.dispose();
   }
 
 
@@ -1229,7 +1134,7 @@ async function updateCollections(): Promise<void> {
   const storeInstance = getStore();
   // Collections are defined in YAML; no duplicate cleanup needed.
 
-  // Clear Ollama cache on update
+  // Clear cached model responses on update
   clearCache(db);
 
   const collections = listCollections(db);
@@ -2252,7 +2157,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const now = new Date().toISOString();
   const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
 
-  // Clear Ollama cache on index
+  // Clear cached model responses on index
   clearCache(db);
 
   // Collection name must be provided (from YAML)
@@ -2489,31 +2394,6 @@ function parseEmbedTimeoutOption(value: unknown): number | undefined {
   return minutes * 60 * 1000;
 }
 
-function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
-  try {
-    const config = loadConfig();
-    const current = config.models ?? {};
-    const defaultLocalModels = {
-      embed: current.embed || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL,
-      generate: current.generate || process.env.QMD_GENERATE_MODEL || DEFAULT_QUERY_MODEL,
-      rerank: current.rerank || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL,
-    };
-    if (current.embed !== defaultLocalModels.embed || current.generate !== defaultLocalModels.generate || current.rerank !== defaultLocalModels.rerank) {
-      saveConfig({
-        ...config,
-        models: {
-          ...current,
-          embed: defaultLocalModels.embed,
-          generate: defaultLocalModels.generate,
-          rerank: defaultLocalModels.rerank,
-        },
-      });
-    }
-    return resolveModels(config.models);
-  } catch {
-    return resolveModels();
-  }
-}
 
 export function resolveEmbedModelForCli(): string {
   try {
@@ -2524,29 +2404,27 @@ export function resolveEmbedModelForCli(): string {
     });
     return resolved.canonical.model;
   } catch {
-    return ensureModelsConfiguredForCli().embed;
+    return resolveModelsForCli().embed;
   }
 }
 
 export function resolveGenerateModelForCli(): string {
-  return ensureModelsConfiguredForCli().generate;
+  return resolveModelsForCli().generate;
 }
 
 export function resolveRerankModelForCli(): string {
-  return ensureModelsConfiguredForCli().rerank;
+  return resolveModelsForCli().rerank;
 }
 
 function resolveModelsForCli(): { embed: string; generate: string; rerank: string } {
-  return ensureModelsConfiguredForCli();
+  try {
+    return resolveModels(loadConfig().models);
+  } catch {
+    // Diagnostics remain available when index.yml cannot be parsed.
+    return resolveModels();
+  }
 }
 
-/** Models that may actually be loaded. Falls back to defaults/env when a
- *  project-local config's custom URIs are not trusted (#889). */
-function resolveModelsForRuntime(): { embed: string; generate: string; rerank: string } {
-  const configured = ensureModelsConfiguredForCli();
-  if (localConfigIsFullyTrusted()) return configured;
-  return resolveModels();
-}
 
 async function vectorIndex(
   model: string = resolveEmbedModelForCli(),
@@ -3322,7 +3200,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   checkIndexHealth(store.db);
   if (opts.filter) warnPendingMetadata(store.db);
 
-  await withLLMSession(async () => {
+  await withLLMSessionForLlm(store.llm!, async () => {
     const results = await vectorSearchQuery(store, query, {
       collection: collectionSearchFilter(collectionNames),
       filter: opts.filter,
@@ -3376,7 +3254,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
     throw new Error("conflicting expansion directives: --expand cannot be combined with lex:");
   }
 
-  await withLLMSession(async () => {
+  await withLLMSessionForLlm(store.llm!, async () => {
     let results;
 
     if (parsed) {
@@ -3551,7 +3429,7 @@ function parseCLI() {
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
-      progress: { type: "boolean" },  // qmd pull: show node-llama-cpp download progress bar
+      progress: { type: "boolean" },  // Accepted for the retired pull command
       "dry-run": { type: "boolean" },  // cleanup: report what would be removed
       // Get options
       l: { type: "string" },  // max lines
@@ -3565,7 +3443,6 @@ function parseCLI() {
       "no-rerank": { type: "boolean", default: false },
       "no-hyde": { type: "boolean", default: false },
       expand: { type: "boolean", default: false },
-      "no-gpu": { type: "boolean", default: false },
       intent: { type: "string" },
       // Chunking options
       "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
@@ -3578,10 +3455,6 @@ function parseCLI() {
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
   });
-
-  if (values["no-gpu"]) {
-    process.env.QMD_FORCE_CPU = "1";
-  }
 
   // Select index name (default: "index"). If no explicit --index is supplied,
   // a project-local .qmd/index.yaml overrides the global config/cache paths.
@@ -4094,7 +3967,7 @@ function showHelp(): void {
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
-  console.log("  qmd pull [--refresh] [--progress] - Download embedding/generation/rerank models");
+  console.log("  qmd pull                 - Retired; remote-only builds do not download models");
   console.log("  qmd cleanup [--dry-run]       - Drop inactive docs/orphans, compact FTS, vacuum");
   console.log("");
   console.log("Query syntax (qmd query):");
@@ -4154,8 +4027,7 @@ function showHelp(): void {
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
-  console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
-  console.log("  --no-gpu                   - Force CPU mode for llama.cpp operations (same as QMD_FORCE_CPU=1)");
+  console.log("  --no-rerank                - Skip remote reranking (use RRF scores only)");
   console.log("  --line-numbers             - Include line numbers (search; get/multi-get are on by default)");
   console.log("  --no-line-numbers          - Disable line numbers for get/multi-get");
   console.log("  --full-path                - Show on-disk paths instead of qmd:// + docid (get/multi-get/search/query)");
@@ -4174,7 +4046,7 @@ function showHelp(): void {
   console.log("  --no-hyde                   - Disable HyDE (hypothetical document) in query expansion");
   console.log("");
   console.log("Embedding providers & disclosure:");
-  console.log("  - Local embedding is the default. OpenAI requires explicit provider configuration and OPENAI_API_KEY.");
+  console.log("  - Embedding requires an explicitly configured remote provider. Local model inference is retired.");
   console.log("  - Remote document builds send titles and deterministic UTF-8 document chunks; vector/hybrid queries send formatted query text.");
 
   console.log("  - Deleting old vectors has no vector rollback; lexical search remains available while rebuilding.");
@@ -4211,73 +4083,6 @@ function normalizedDoctorNextSteps(steps: string[]): string[] {
   return unique.filter(step => !step.includes("qmd embed") || step.startsWith("Run `qmd embed --force`"));
 }
 
-function shortHashSeq(hashSeq: string): string {
-  const idx = hashSeq.lastIndexOf("_");
-  if (idx < 0) return hashSeq.length > 18 ? `${hashSeq.slice(0, 18)}...` : hashSeq;
-  return `${hashSeq.slice(0, 12)}_${hashSeq.slice(idx + 1)}`;
-}
-
-type DoctorVectorSampleResult = {
-  ok: boolean;
-  details: string;
-};
-
-function decodeStoredEmbedding(bytes: Uint8Array): Float32Array {
-  return new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
-}
-
-function cosineDistance(a: ArrayLike<number>, b: ArrayLike<number>): number {
-  if (a.length !== b.length || a.length === 0) return Number.POSITIVE_INFINITY;
-  let dot = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let i = 0; i < a.length; i++) {
-    const av = a[i] ?? 0;
-    const bv = b[i] ?? 0;
-    dot += av * bv;
-    normA += av * av;
-    normB += bv * bv;
-  }
-  if (normA === 0 || normB === 0) return Number.POSITIVE_INFINITY;
-  return 1 - (dot / (Math.sqrt(normA) * Math.sqrt(normB)));
-}
-
-type CachedModelInspection = {
-  path: string | null;
-  invalid: string[];
-};
-
-function formatModelDiagnosticPath(path: string): string {
-  return sanitizeDiagnosticMessage(path);
-}
-
-function findCachedModelInspection(model: string): CachedModelInspection {
-  const invalid: string[] = [];
-  if (model.startsWith("hf:")) {
-    const filename = model.split("/").pop();
-    if (!filename || !existsSync(DEFAULT_MODEL_CACHE_DIR)) return { path: null, invalid };
-    const entries = readdirSync(DEFAULT_MODEL_CACHE_DIR, { withFileTypes: true });
-    for (const entry of entries) {
-      // Only consider real `.gguf` blobs. `qmd pull` writes a `<filename>.etag`
-      // HTTP sidecar next to each download; that name also satisfies
-      // `includes(filename)`, so inspecting it as GGUF false-positives
-      // "invalid model" in `qmd doctor` whenever readdir yields the sidecar
-      // before the blob (#812).
-      if (!entry.isFile() || !entry.name.endsWith(".gguf") || !entry.name.includes(filename)) continue;
-      const candidate = pathJoin(DEFAULT_MODEL_CACHE_DIR, entry.name);
-      const inspection = inspectGgufFile(candidate);
-      if (inspection.valid) return { path: candidate, invalid };
-      invalid.push(`${formatModelDiagnosticPath(candidate)}: ${inspection.details}`);
-    }
-    return { path: null, invalid };
-  }
-
-  const inspection = inspectGgufFile(model);
-  if (inspection.valid) return { path: model, invalid };
-  if (inspection.exists) invalid.push(`${formatModelDiagnosticPath(model)}: ${inspection.details}`);
-  return { path: null, invalid };
-}
-
 type EnvOverride = {
   name: string;
   value: string;
@@ -4302,31 +4107,20 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
     const configured = configModels[key];
     const consequence = configured && configured !== raw
       ? `set but ignored because index models.${key} is configured as ${configured}`
-      : `sets the active ${key} model to ${active}; changes embedding/search semantics and may require \`qmd pull\` plus \`qmd embed\``;
+      : `sets the active ${key} model to ${active}; changes embedding/search semantics and requires explicit remote configuration and may require a manual \`qmd embed --force\``;
     overrides.push({ name, value: envValueForDisplay(raw), consequence });
   };
 
   add("INDEX_PATH", "overrides the SQLite index path; QMD reads/writes a different database");
   add("QMD_CONFIG_DIR", "overrides the QMD config directory and takes precedence over XDG_CONFIG_HOME");
   add("XDG_CONFIG_HOME", "moves QMD config to $XDG_CONFIG_HOME/qmd when QMD_CONFIG_DIR is not set");
-  add("XDG_CACHE_HOME", "moves the default index cache, model cache, and MCP daemon PID files");
+  add("XDG_CACHE_HOME", "moves the default index cache and MCP daemon PID files");
   addModel("QMD_EMBED_MODEL", "embed", activeModels.embed);
   addModel("QMD_GENERATE_MODEL", "generate", activeModels.generate);
   addModel("QMD_RERANK_MODEL", "rerank", activeModels.rerank);
-  add("QMD_FORCE_CPU", "forces llama.cpp to bypass GPU backends; embeddings/query will be slower but GPU crashes are avoided");
-  add("QMD_LLAMA_GPU", "selects llama.cpp GPU backend (metal/cuda/vulkan) or disables GPU when set to false/off/0");
-  add("QMD_DOCTOR_DEVICE_PROBE", "controls qmd doctor native device probing; 0/off skips GPU probing");
-  add("QMD_EMBED_PARALLELISM", "overrides embedding parallel context count; too high can exhaust RAM/VRAM");
-  add("QMD_EXPAND_CONTEXT_SIZE", "overrides query expansion context size; larger values use more memory");
-  add("QMD_RERANK_CONTEXT_SIZE", "overrides reranker context size; larger values use more memory");
-  add("QMD_EMBED_CONTEXT_SIZE", "overrides embed context size; larger values use more memory");
   add("QMD_EDITOR_URI", "overrides clickable editor link template in terminal output");
   add("QMD_SKILLS_DIR", "overrides where qmd skills are discovered from");
-  add("QMD_METAL_KEEP_RESIDENCY", "opts back into libggml-metal residency sets on darwin; restores ~0ms perf wins for long-lived processes but re-exposes the static-destructor backtrace dump at process exit (ggml-org/llama.cpp#22593)");
-  add("GGML_METAL_NO_RESIDENCY", "set automatically by the launcher on darwin to disable Metal residency sets (avoids ggml-org/llama.cpp#22593); override via QMD_METAL_KEEP_RESIDENCY=1");
   add("NO_COLOR", "disables colored terminal output");
-  add("CI", "disables real LLM operations inside QMD's LlamaCpp wrapper");
-  add("HF_ENDPOINT", "changes Hugging Face download endpoint used when pulling models");
   add("QMD_WRAPPER_CAPTURE", "test/debug hook for the qmd shell wrapper; should not be set in normal use");
   add("WSL_DISTRO_NAME", "enables WSL path handling heuristics");
   add("WSL_INTEROP", "enables WSL path handling heuristics");
@@ -4372,308 +4166,19 @@ function checkEnvironmentOverrides(activeModels: { embed: string; generate: stri
 }
 
 function checkModelDefaults(
-  activeModels: { embed: string; generate: string; rerank: string },
+  _activeModels: { embed: string; generate: string; rerank: string },
   configModels: ModelsConfig = {},
   doctorEmbedding?: { provider: string },
 ): void {
-  const isRemoteEmbed = Boolean(
-    doctorEmbedding?.provider === "openai"
-    || doctorEmbedding?.provider === "voyageai"
-    || configModels.embed_api_url
-    || configModels.embed_base_url
-    || configModels.embed_url
-    || configModels.embed_api_model,
-  );
-  const isRemoteGen = Boolean(
-    configModels.generate_api_url
-    || configModels.generate_base_url
-    || configModels.generate_url
-    || configModels.generate_api_model,
-  );
-  const isRemoteRerank = Boolean(
-    configModels.rerank_api_url
-    || configModels.rerank_base_url
-    || configModels.rerank_url
-    || configModels.rerank_api_model,
-  );
-
-  const checks = [
-    { role: "embedding", key: "embed", isRemote: isRemoteEmbed, active: activeModels.embed, configured: configModels.embed, defaultModel: DEFAULT_EMBED_MODEL, envName: "QMD_EMBED_MODEL", envValue: process.env.QMD_EMBED_MODEL },
-    { role: "generation", key: "generate", isRemote: isRemoteGen, active: activeModels.generate, configured: configModels.generate, defaultModel: DEFAULT_QUERY_MODEL, envName: "QMD_GENERATE_MODEL", envValue: process.env.QMD_GENERATE_MODEL },
-    { role: "reranking", key: "rerank", isRemote: isRemoteRerank, active: activeModels.rerank, configured: configModels.rerank, defaultModel: DEFAULT_RERANK_MODEL, envName: "QMD_RERANK_MODEL", envValue: process.env.QMD_RERANK_MODEL },
-  ] as const;
-
-  const notes: string[] = [];
-  for (const check of checks) {
-    if (check.isRemote) continue;
-    const envValue = check.envValue?.trim();
-    if (envValue && check.active === envValue) {
-      notes.push(`${check.role}: env ${check.envName}=${check.active} (default ${check.defaultModel}; might be ok)`);
-    } else if (check.configured && check.configured !== check.defaultModel) {
-      notes.push(`${check.role}: index ${check.configured} (default ${check.defaultModel}; might be ok)`);
-    } else if (envValue && check.active !== envValue) {
-      notes.push(`${check.role}: ${check.envName} is set to ${envValue} but index config uses ${check.active}`);
-    }
-  }
-
-  if (notes.length === 0) {
-    doctorCheck("model defaults", true, "using QMD codebase defaults");
-    return;
-  }
-
-  doctorCheck("model defaults", false, `non-default model configuration: ${notes.join("; ")}`);
-}
-
-function checkModelCache(activeModels: { embed: string; generate: string; rerank: string }, nextSteps: string[]): void {
-  const models = [
-    ["embedding", activeModels.embed],
-    ["generation", activeModels.generate],
-    ["reranking", activeModels.rerank],
-  ] as const;
-  const unique = new Map<string, string[]>();
-  for (const [role, model] of models) {
-    unique.set(model, [...(unique.get(model) ?? []), role]);
-  }
-
-  const missing: string[] = [];
-  const cached: string[] = [];
-  const invalid: string[] = [];
-  for (const [model, roles] of unique) {
-    const label = `${roles.join("+")}: ${model}`;
-    const isRemoteApi = !model.startsWith("hf:") && !existsSync(model) && !model.endsWith(".gguf");
-    if (isRemoteApi) {
-      cached.push(`${label} (remote API)`);
-      continue;
-    }
-    const inspection = findCachedModelInspection(model);
-    invalid.push(...inspection.invalid.map(detail => `${label} (${detail})`));
-    if (inspection.path) {
-      cached.push(label);
-    } else {
-      missing.push(label);
-    }
-  }
-
-  if (missing.length === 0 && invalid.length === 0) {
-    doctorCheck("model cache", true, `${cached.length} active ${cached.length === 1 ? "model is" : "models are"} downloaded and valid GGUF`);
-    return;
-  }
-
-  const parts: string[] = [];
-  if (invalid.length > 0) parts.push(`invalid ${invalid.length}: ${invalid.join("; ")}`);
-  if (missing.length > 0) parts.push(`missing ${missing.length}/${unique.size}: ${missing.join("; ")}`);
-  const next = invalid.length > 0
-    ? "Next: run `qmd pull --refresh` (or remove the bad cached file)"
-    : "Next: run `qmd pull`";
-  doctorCheck("model cache", false, `${parts.join("; ")}. ${next}`);
-  if (invalid.length > 0) {
-    nextSteps.push("Run `qmd pull --refresh` to replace invalid cached model files, or delete the listed file and rerun `qmd pull`.");
-  } else {
-    nextSteps.push("Run `qmd pull` to download missing embedding/generation/reranking models before `qmd embed` or `qmd query`.");
-  }
-}
-
-async function checkEmbeddingVectorSamples(db: Database, model: string, fingerprint: string, sampleSize: number = 3): Promise<DoctorVectorSampleResult> {
-  const activeDocs = (db.prepare(`SELECT COUNT(*) AS count FROM documents WHERE active = 1`).get() as { count: number }).count;
-  if (activeDocs === 0) {
-    return { ok: true, details: "no active documents indexed" };
-  }
-
-  const vecTableExists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-  if (!vecTableExists) {
-    return { ok: false, details: "no vector table to test; please run qmd embed again" };
-  }
-
-  const samples = db.prepare(`
-    SELECT cv.hash, cv.seq, c.doc AS body, MIN(d.path) AS path
-    FROM content_vectors cv
-    JOIN documents d ON d.hash = cv.hash AND d.active = 1
-    JOIN content c ON c.hash = cv.hash
-    WHERE cv.model = ? AND cv.embed_fingerprint = ?
-    GROUP BY cv.hash, cv.seq, c.doc
-    ORDER BY random()
-    LIMIT ?
-  `).all(model, fingerprint, sampleSize) as { hash: string; seq: number; body: string; path: string }[];
-
-  if (samples.length === 0) {
-    return { ok: false, details: "no current embedded chunks to test; please run qmd embed again" };
-  }
-
-  const threshold = 0.0001;
-  const mismatches: string[] = [];
-
-  await withLLMSession(async (session) => {
-    for (const sample of samples) {
-      const hashSeq = `${sample.hash}_${sample.seq}`;
-      const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
-      const chunk = chunks[sample.seq];
-      if (!chunk) {
-        mismatches.push(`${shortHashSeq(hashSeq)}: chunk no longer exists`);
-        continue;
-      }
-
-      const title = extractTitle(sample.body, sample.path);
-      const result = await session.embed(formatDocForEmbedding(chunk.text, title, model), { model });
-      if (!result) {
-        mismatches.push(`${shortHashSeq(hashSeq)}: embedding failed`);
-        continue;
-      }
-
-      const stored = db.prepare(`SELECT embedding FROM vectors_vec WHERE hash_seq = ?`).get(hashSeq) as { embedding: Uint8Array } | undefined;
-      if (!stored) {
-        mismatches.push(`${shortHashSeq(hashSeq)}: stored vector missing`);
-        continue;
-      }
-
-      const distance = cosineDistance(result.embedding, decodeStoredEmbedding(stored.embedding));
-      if (distance > threshold) {
-        mismatches.push(`${shortHashSeq(hashSeq)}: stored vector distance ${distance.toFixed(6)}`);
-      }
-    }
-  }, { maxDuration: 10 * 60 * 1000, name: "doctorEmbeddingVectorSample" });
-
-  if (mismatches.length > 0) {
-    return {
-      ok: false,
-      details: `${mismatches.length}/${samples.length} sampled chunks differ from stored vectors (${mismatches[0]}). Rebuild with \`qmd embed --force\``,
-    };
-  }
-
-  return {
-    ok: true,
-    details: `${samples.length} sampled ${samples.length === 1 ? "chunk" : "chunks"} reproduce stored vectors`,
-  };
-}
-
-function hasLibraryInDirs(libraryBaseName: string, dirs: string[]): boolean {
-  for (const dir of dirs) {
-    if (!dir || !existsSync(dir)) continue;
-    try {
-      for (const entry of readdirSync(dir)) {
-        if (entry === libraryBaseName || entry.startsWith(`${libraryBaseName}.`)) return true;
-      }
-    } catch { /* ignore unreadable system library dirs */ }
-  }
-  return false;
-}
-
-function linuxCudaRuntimeDiagnostic(): string | null {
-  if (process.platform !== "linux") return null;
-
-  const dirs = new Set<string>();
-  for (const value of [process.env.LD_LIBRARY_PATH, process.env.CUDA_PATH]) {
-    for (const part of (value ?? "").split(":")) {
-      if (part) dirs.add(part);
-    }
-  }
-  if (process.env.CUDA_PATH) {
-    dirs.add(pathJoin(process.env.CUDA_PATH, "lib64"));
-    dirs.add(pathJoin(process.env.CUDA_PATH, "targets", "x86_64-linux", "lib"));
-  }
-  for (const dir of ["/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/local/cuda/lib64", "/usr/local/cuda/targets/x86_64-linux/lib"]) {
-    dirs.add(dir);
-  }
-  try {
-    for (const entry of readdirSync("/usr/local")) {
-      if (!entry.toLowerCase().startsWith("cuda-")) continue;
-      const cudaRoot = pathJoin("/usr/local", entry);
-      dirs.add(pathJoin(cudaRoot, "lib64"));
-      dirs.add(pathJoin(cudaRoot, "targets", "x86_64-linux", "lib"));
-    }
-  } catch { /* /usr/local may not be readable in restricted environments */ }
-
-  const searchDirs = [...dirs];
-  const hasDriver = hasLibraryInDirs("libcuda.so", searchDirs) || hasLibraryInDirs("libnvidia-ml.so", searchDirs);
-  if (!hasDriver) return null;
-
-  const cudaLibraries: [library: string, label: string][] = [
-    ["libcudart.so", "CUDA runtime"],
-    ["libcublas.so", "cuBLAS"],
-    ["libcublasLt.so", "cuBLASLt"],
-  ];
-  const missing = cudaLibraries
-    .filter(([library]) => !hasLibraryInDirs(library, searchDirs))
-    .map(([, label]) => label);
-
-  if (missing.length === 0) return null;
-  return `NVIDIA driver libraries are visible, but CUDA user-space libraries are missing from loader paths (${missing.join(", ")})`;
-}
-
-async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
-  const mode = configuredGpuModeLabel();
-  doctorCheck("device mode", true, mode);
-
-  const skipProbe = ["0", "false", "off", "no", "skip"].includes((process.env.QMD_DOCTOR_DEVICE_PROBE ?? "").trim().toLowerCase());
-  if (skipProbe) {
-    doctorCheck("device probe", false, "skipped by QMD_DOCTOR_DEVICE_PROBE=0. Next: unset it and rerun `qmd doctor` to verify GPU/CPU acceleration");
-    nextSteps.push("Unset `QMD_DOCTOR_DEVICE_PROBE` and rerun `qmd doctor` when you want to verify llama.cpp device acceleration.");
-    return;
-  }
-
-  const crashHint = "Probing native llama backend now. If qmd crashes here, rerun with `QMD_FORCE_CPU=1 qmd doctor` (or `QMD_DOCTOR_DEVICE_PROBE=0 qmd doctor` to skip this probe).";
-  if (process.stdout.isTTY) {
-    process.stdout.write(`${c.dim}${crashHint}${c.reset}`);
-  }
-
-  try {
-    const device = await getDefaultLlamaCpp().getDeviceInfo({ allowBuild: false });
-    if (process.stdout.isTTY) {
-      process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
-    }
-    if (device.gpu) {
-      const gpuLabel = device.gpu === "metal" && process.platform === "darwin"
-        ? "metal (macOS Metal backend)"
-        : String(device.gpu);
-      const parts = [`GPU ${gpuLabel}`, `offloading ${device.gpuOffloading ? "enabled" : "disabled"}`];
-      if (device.gpuDevices.length > 0) parts.push(`devices: ${summarizeDeviceNames(device.gpuDevices)}`);
-      if (device.vram) parts.push(`VRAM ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
-      parts.push(`${device.cpuCores} CPU math cores`);
-      doctorCheck("device probe", device.gpuOffloading, device.gpuOffloading
-        ? parts.join("; ")
-        : `${parts.join("; ")}. Next: check QMD_LLAMA_GPU and llama.cpp backend support`);
-      if (!device.gpuOffloading) {
-        nextSteps.push("GPU was detected but offloading is disabled; check `QMD_LLAMA_GPU=metal|cuda|vulkan` and rerun `qmd doctor`.");
-      }
-
-      // Surface the darwin residency-set mitigation. libggml-metal's
-      // process-static device dtor asserts on un-expired residency sets
-      // during libc exit() (ggml-org/llama.cpp#22593), producing a giant
-      // stderr backtrace after correct output. The bin/qmd launcher exports
-      // GGML_METAL_NO_RESIDENCY=1 on darwin to skip the assertion entirely.
-      // No measurable perf cost on short-lived CLI calls.
-      if (device.gpu === "metal" && process.platform === "darwin") {
-        if (isDarwinMetalMitigationActive()) {
-          doctorCheck(
-            "darwin metal residency",
-            true,
-            "GGML_METAL_NO_RESIDENCY=1 set by launcher; clean process exit (avoids ggml-org/llama.cpp#22593). Opt back in with QMD_METAL_KEEP_RESIDENCY=1 if you run long-lived qmd processes."
-          );
-        } else {
-          doctorCheck(
-            "darwin metal residency",
-            false,
-            "residency sets active (QMD_METAL_KEEP_RESIDENCY=1 or launcher bypassed); llama-using commands may dump a libggml-metal backtrace at exit (ggml-org/llama.cpp#22593) even when output succeeded."
-          );
-          nextSteps.push("Unset `QMD_METAL_KEEP_RESIDENCY` so the launcher can disable Metal residency sets; without this, query/vsearch/embed dump a stack trace at exit even on success.");
-        }
-      }
-    } else {
-      const cudaDiagnostic = linuxCudaRuntimeDiagnostic();
-      const diagnosticSuffix = cudaDiagnostic ? ` ${cudaDiagnostic}.` : "";
-      doctorCheck("device probe", false, `running on CPU (${device.cpuCores} math cores).${diagnosticSuffix} Next: install/configure Metal, CUDA, or Vulkan for faster embeddings, or set QMD_FORCE_CPU=1 to make CPU mode explicit`);
-      if (cudaDiagnostic) {
-        nextSteps.push(`${cudaDiagnostic}; install CUDA runtime/cuBLAS libraries or add their directory to LD_LIBRARY_PATH, then rerun \`qmd doctor\`.`);
-      } else {
-        nextSteps.push("Vector operations are running on CPU; install/configure Metal, CUDA, or Vulkan if embedding/query performance is too slow.");
-      }
-    }
-  } catch (error) {
-    if (process.stdout.isTTY) {
-      process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
-    }
-    const message = error instanceof Error ? sanitizeDiagnosticMessage(error.message) : sanitizeDiagnosticMessage(String(error));
-    doctorCheck("device probe", false, `probe failed: ${message}. Next: run with QMD_FORCE_CPU=1 to bypass GPU probing, or set QMD_LLAMA_GPU=metal|cuda|vulkan and retry`);
-    nextSteps.push("GPU probe failed; try `QMD_FORCE_CPU=1 qmd doctor` to confirm CPU fallback, then fix GPU drivers/backend if acceleration is expected.");
+  const retired = ["embed", "generate", "rerank"]
+    .filter(role => Boolean(configModels[role as "embed" | "generate" | "rerank"]))
+    .map(role => `models.${role}`);
+  doctorCheck("model configuration", retired.length === 0,
+    retired.length ? `${retired.join(", ")} are legacy diagnostic fields; local inference is retired` :
+      "remote APIs are used only when configured; BM25 and document reads need no model");
+  if (doctorEmbedding?.provider === "local") {
+    doctorCheck("embedding configuration", false,
+      "no remote embedding provider configured; old vectors remain unchanged. Configure remote embeddings, then explicitly run qmd embed --force for vector search");
   }
 }
 
@@ -4754,7 +4259,7 @@ async function showDoctor(): Promise<void> {
   const configModels = configCheck.config?.models ?? {};
   checkEnvironmentOverrides(activeModels, configModels);
   checkModelDefaults(activeModels, configModels, doctorEmbedding);
-  checkModelCache(activeModels, nextSteps);
+  doctorCheck("remote-only runtime", true, "local GGUF inference and model downloads are retired; diagnostics send no model requests");
 
   const isRemoteEmbed = Boolean(
     doctorEmbedding.provider === "openai"
@@ -4816,7 +4321,6 @@ async function showDoctor(): Promise<void> {
     doctorCheck("typesafe jev", true, `${jevModel} (endpoint: ${jevEndpoint})`);
   }
 
-  await runDoctorDeviceChecks(nextSteps);
 
   const diagnostics = inspectIndexDiagnostics(db, {
     fallbackModel: embedModel,
@@ -4943,23 +4447,7 @@ async function showDoctor(): Promise<void> {
     doctorCheck("embedding fingerprints", false, error instanceof Error ? error.message : String(error));
   }
 
-  if (diagnostics.embedding.provider.remote) {
-    doctorCheck("embedding vector sample", true, "skipped for remote provider; doctor sends no remote embedding request");
-  } else if (fingerprint != null) {
-    try {
-      const vectorSample = await checkEmbeddingVectorSamples(db, embedModel, fingerprint);
-      doctorCheck("embedding vector sample", vectorSample.ok, vectorSample.details);
-      if (!vectorSample.ok) {
-        nextSteps.push("Run `qmd embed --force` to rebuild existing vectors that no longer reproduce under the current embedding pipeline.");
-      }
-    } catch (error) {
-      const message = error instanceof Error ? sanitizeDiagnosticMessage(error.message) : sanitizeDiagnosticMessage(String(error));
-      doctorCheck("embedding vector sample", false, `${message}; rebuild with \`qmd embed --force\``);
-      nextSteps.push("Run `qmd embed --force` to rebuild existing vectors, then rerun `qmd doctor`.");
-    }
-  } else {
-    doctorCheck("embedding vector sample", true, "skipped until the local embedding dimension is known");
-  }
+  doctorCheck("embedding vector sample", true, "skipped; doctor never sends embedding requests");
 
   const steps = normalizedDoctorNextSteps(nextSteps);
   if (steps.length > 0) {
@@ -5385,28 +4873,9 @@ if (isMain) {
       }
       break;
 
-    case "pull": {
-      await resolveLocalConfigTrust();
-      const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
-      const activeModels = resolveModelsForRuntime();
-      const models = [
-        activeModels.embed,
-        activeModels.generate,
-        activeModels.rerank,
-      ];
-      console.log(`${c.bold}Pulling models${c.reset}`);
-      const results = await pullModels(models, {
-        refresh,
-        cacheDir: DEFAULT_MODEL_CACHE_DIR,
-        cli: Boolean(cli.values.progress),
-      });
-      for (const result of results) {
-        const size = formatBytes(result.sizeBytes);
-        const note = result.refreshed ? "refreshed" : "cached/checked";
-        console.log(`- ${result.model} -> ${result.path} (${size}, ${note})`);
-      }
-      break;
-    }
+    case "pull":
+      console.error("qmd pull is retired: this build supports remote model APIs only. Configure models.embed_*, models.generate_*, and models.rerank_*; no model files were downloaded.");
+      process.exit(1);
 
     case "search":
       if (!cli.query) {

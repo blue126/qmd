@@ -124,6 +124,7 @@ export class UnavailableVoyageEmbeddingProvider implements EmbeddingProvider {
   readonly model: VoyageEmbeddingModel;
   readonly dimension: number;
   readonly remote = true;
+  readonly available = false;
   private readonly configuredBaseUrl: string | undefined;
   private readonly reason: string;
 

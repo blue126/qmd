@@ -1,7 +1,7 @@
 {
   "name": "@wei840222/qmd",
-  "version": "2026.10.18",
-  "description": "Query Markup Documents - On-device hybrid search for markdown files with BM25, vector search, and LLM reranking",
+  "version": "2026.10.18-remote.0",
+  "description": "Hybrid search for markdown with local BM25 and remote embedding, expansion, and reranking APIs",
   "author": "Wan, Jiun Wei <wei840222@gmail.com>",
   "license": "MIT",
   "keywords": [
@@ -18,7 +18,6 @@
     "mcp",
     "reranking",
     "knowledge-base",
-    "local-ai",
     "llm"
   ],
   "engines": {
@@ -56,8 +55,6 @@
     "lint": "oxlint",
     "test": "node scripts/test-all.mjs",
     "test:types": "node ./node_modules/typescript/bin/tsc -p tsconfig.build.json --noEmit",
-    "test:models": "node scripts/test-runtime.mjs",
-    "test:models:only": "node scripts/test-runtime.mjs --models-only",
     "test:unit": "CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000 test/",
     "test:quality": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose test/eval-cjk.test.ts",
     "test:package": "node scripts/package-smoke.mjs",
@@ -72,7 +69,8 @@
     "search": "tsx src/cli/qmd.ts search",
     "vsearch": "tsx src/cli/qmd.ts vsearch",
     "rerank": "tsx src/cli/qmd.ts rerank",
-    "bench": "tsx src/cli/qmd.ts bench"
+    "bench": "tsx src/cli/qmd.ts bench",
+    "test:remote": "node scripts/test-runtime.mjs"
   },
   "publishConfig": {
     "access": "public"
@@ -91,7 +89,6 @@
     "@typesafe-ai/sdk": "^0.6.0",
     "fast-glob": "3.3.3",
     "lru-cache": "^11.5.3",
-    "node-llama-cpp": "3.22.1",
     "picomatch": "4.0.7",
     "sqlite-vec": "0.1.9",
     "tree-sitter-go": "0.25.0",
@@ -116,20 +113,11 @@
     "vitest": "4.1.11"
   },
   "overrides": {
-    "@hono/node-server": "2.1.2",
-    "ajv": "8.20.0",
     "esbuild": "0.28.2",
-    "fast-uri": "3.1.5",
-    "hono": "4.13.10",
-    "ip-address": "10.7.2",
     "nanoid": "3.3.18",
-    "path-to-regexp": "8.4.2",
     "postcss": "8.5.28",
-    "qs": "6.16.0",
     "rollup": "4.63.5",
-    "simple-git": "4.0.2",
     "source-map-js": "1.2.2",
-    "tar": "7.5.22",
     "vite": "7.3.5"
   },
   "peerDependencies": {

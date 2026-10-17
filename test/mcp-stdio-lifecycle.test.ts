@@ -203,7 +203,7 @@ describe("registerStdioEofShutdown", () => {
     const exitCodes: number[] = [];
 
     // Mirror how startMcpServer wires it: no disposeLlm — store.close() disposes
-    // the store's own LlamaCpp, so there must be no extra global disposal step.
+    // the store's own remote clients, so there must be no extra global disposal step.
     const shutdown = registerStdioEofShutdown({
       stdin,
       closeServer: async () => { calls.push("server-close"); },

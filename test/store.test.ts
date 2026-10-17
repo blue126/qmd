@@ -1,9 +1,9 @@
 /**
  * store.test.ts - Comprehensive unit tests for the QMD store module
  *
- * Run with: bun test store.test.ts
+ * Run with: pnpm test test/store.test.ts
  *
- * LLM operations use LlamaCpp with local GGUF models (node-llama-cpp).
+ * Model operations use injected remote services.
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
@@ -14,9 +14,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
 import * as llmModule from "../src/llm.js";
-import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
+  canonicalEmbeddingBuildMaterial,
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
   verifySqliteVecLoaded,
@@ -30,7 +30,6 @@ import {
   formatDocForEmbedding,
   getEmbeddingFingerprint,
   chunkDocument,
-  chunkDocumentByTokens,
   chunkDocumentAsync,
   chunkDocumentWithBreakPoints,
   mergeBreakPoints,
@@ -76,13 +75,6 @@ import {
   createEmbeddingIdentity,
 } from "../src/embedding/identity.js";
 import type { CollectionConfig } from "../src/collections.js";
-
-// =============================================================================
-// LlamaCpp Setup
-// =============================================================================
-
-// Note: LlamaCpp uses node-llama-cpp for local GGUF model inference.
-// No HTTP mocking needed - tests use real LlamaCpp calls for integration tests.
 
 // =============================================================================
 // Test Utilities
@@ -136,20 +128,24 @@ function publishSearchableFixture(store: Store, model: string): void {
 }
 
 function beginEmbeddingFixture(store: Store, model: string, dimension: number) {
-  const identity = createEmbeddingIdentity({
-    providerId: "local-test",
-    model,
-    dimension,
-    remote: false,
-    canonicalMaterial: JSON.stringify({ provider: "local-test", model, dimension }),
-  });
-  const lease = beginEmbeddingBuild(store.db, identity, {
-    ownerId: "query-fixture",
-    now: Date.now(),
-    leaseMs: 60_000,
-    allowDestructiveRebuild: true,
-  });
-  return { identity, lease };
+  const provider = {
+    providerId: "remote-test", model, dimension, remote: true,
+    canonicalIdentityMaterial: () => JSON.stringify({provider:"remote-test",model,dimension}),
+    formatQuery: (text: string) => text,
+    formatDocument: (text: string) => text,
+    embed: async (text: string) => ({vector: (await store.llm.embed(text))?.embedding ?? [1,0,0], model, dimension}),
+    embedBatch: async (texts: string[]) => {
+      const llm = store.llm as any;
+      const results = llm.embedBatch ? await llm.embedBatch(texts) : texts.map(() => ({embedding:[1,0,0]}));
+      return results.map((result: any) => ({vector:result.embedding,model,dimension}));
+    },
+    close: async () => {},
+  };
+  store.embeddingProvider = provider;
+  store.authorizeRemoteRequest = () => {};
+  const identity = createEmbeddingIdentity({providerId:provider.providerId, model, dimension, remote:true, canonicalMaterial:canonicalEmbeddingBuildMaterial(provider.canonicalIdentityMaterial(), "regex")});
+  const lease = beginEmbeddingBuild(store.db, identity, {ownerId:"query-fixture",now:Date.now(),leaseMs:60_000,allowDestructiveRebuild:true});
+  return {identity,lease};
 }
 
 function insertCorruptEmbeddingFixture(
@@ -358,7 +354,6 @@ beforeAll(async () => {
 
 afterAll(async () => {
   // Ensure native resources are released to avoid ggml-metal asserts on process exit.
-  await disposeDefaultLlamaCpp();
 
   try {
     // Clean up test directory
@@ -760,68 +755,6 @@ describe("Document Chunking", () => {
   });
 });
 
-describe.skipIf(!!process.env.CI)("Token-based Chunking", () => {
-  test("chunkDocumentByTokens returns single chunk for small documents", async () => {
-    const content = "This is a small document.";
-    const chunks = await chunkDocumentByTokens(content, 900, 135);
-    expect(chunks).toHaveLength(1);
-    expect(chunks[0]!.text).toBe(content);
-    expect(chunks[0]!.pos).toBe(0);
-    expect(chunks[0]!.tokens).toBeGreaterThan(0);
-    expect(chunks[0]!.tokens).toBeLessThan(900);
-  });
-
-  test("chunkDocumentByTokens splits large documents", async () => {
-    // Create a document that's definitely more than 900 tokens
-    const content = "The quick brown fox jumps over the lazy dog. ".repeat(250);
-    const chunks = await chunkDocumentByTokens(content, 900, 135);
-
-    expect(chunks.length).toBeGreaterThan(1);
-
-    // Each chunk should have ~900 tokens or less
-    for (const chunk of chunks) {
-      expect(chunk.tokens).toBeLessThanOrEqual(950);  // Allow slight overage
-      expect(chunk.tokens).toBeGreaterThan(0);
-    }
-
-    // Chunks should have correct positions
-    for (let i = 0; i < chunks.length; i++) {
-      expect(chunks[i]!.pos).toBeGreaterThanOrEqual(0);
-      if (i > 0) {
-        expect(chunks[i]!.pos).toBeGreaterThan(chunks[i - 1]!.pos);
-      }
-    }
-  });
-
-  test("chunkDocumentByTokens creates overlapping chunks", async () => {
-    const content = "Word ".repeat(500);  // ~500 tokens
-    const chunks = await chunkDocumentByTokens(content, 200, 30);  // 15% overlap
-
-    expect(chunks.length).toBeGreaterThan(1);
-
-    // With overlap, consecutive chunks should have overlapping positions
-    for (let i = 1; i < chunks.length; i++) {
-      const prevEnd = chunks[i - 1]!.pos + chunks[i - 1]!.text.length;
-      const currentStart = chunks[i]!.pos;
-      // Current chunk should start before the previous chunk ended (overlap)
-      expect(currentStart).toBeLessThan(prevEnd);
-    }
-  });
-
-  test("chunkDocumentByTokens returns actual token counts", async () => {
-    const content = "Hello world, this is a test.";
-    const chunks = await chunkDocumentByTokens(content);
-
-    expect(chunks).toHaveLength(1);
-    // The token count should be reasonable (not 0, not equal to char count)
-    expect(chunks[0]!.tokens).toBeGreaterThan(0);
-    expect(chunks[0]!.tokens).toBeLessThan(content.length);  // Tokens < chars for English
-  });
-});
-
-// =============================================================================
-// Smart Chunking - Break Point Detection Tests
-// =============================================================================
 
 describe("scanBreakPoints", () => {
   test("detects h1 headings", () => {
@@ -1329,59 +1262,6 @@ describe("Caching", () => {
     await cleanupTestDb(store);
   });
 
-  test("rerank cache key includes the resolved rerank model (#764)", async () => {
-    const store = await createTestStore();
-    const query = "rerank cache model swap";
-    const chunk = "identical chunk text";
-    const docs = [{ file: "doc.md", text: chunk }];
-
-    const makeMock = (modelName: string, score: number) => {
-      const rerankSpy = vi.fn(async (_query: string, scoredDocs: { file: string; text: string }[]) => ({
-        results: scoredDocs.map((doc, index) => ({ file: doc.file, score, index })),
-        model: modelName,
-      }));
-      return {
-        spy: rerankSpy,
-        llm: { rerank: rerankSpy, rerankModelName: modelName },
-      };
-    };
-
-    const modelA = "hf:example/rerank-a/a.gguf";
-    const modelB = "hf:example/rerank-b/b.gguf";
-    const mockA = makeMock(modelA, 0.11);
-    const llmSpy = vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue(mockA.llm as any);
-
-    try {
-      const first = await store.rerank(query, docs);
-      expect(first[0]!.score).toBe(0.11);
-      expect(mockA.spy).toHaveBeenCalledTimes(1);
-
-      const keyA = getCacheKey("rerank", { query, model: modelA, chunk });
-      const keyB = getCacheKey("rerank", { query, model: modelB, chunk });
-      const keyDefault = getCacheKey("rerank", { query, model: DEFAULT_RERANK_MODEL, chunk });
-      const keyNoModel = getCacheKey("rerank", { query, chunk });
-
-      expect(store.getCachedResult(keyA)).toBe("0.11");
-      expect(store.getCachedResult(keyNoModel)).toBeNull();
-      expect(store.getCachedResult(keyDefault)).toBeNull();
-
-      const mockB = makeMock(modelB, 0.99);
-      llmSpy.mockReturnValue(mockB.llm as any);
-
-      const second = await store.rerank(query, docs);
-      expect(mockB.spy).toHaveBeenCalledTimes(1);
-      expect(second[0]!.score).toBe(0.99);
-      expect(store.getCachedResult(keyB)).toBe("0.99");
-
-      const third = await store.rerank(query, docs);
-      expect(mockB.spy).toHaveBeenCalledTimes(1);
-      expect(third[0]!.score).toBe(0.99);
-    } finally {
-      llmSpy.mockRestore();
-      await cleanupTestDb(store);
-    }
-  });
-
   test("rerank cache key follows store.llm.rerankModelName (#764)", async () => {
     const store = await createTestStore();
     const query = "store.llm model swap";
@@ -1414,7 +1294,7 @@ describe("Caching", () => {
     }
   });
 
-  test("rerank cache key isolates Hybrid with RemoteJev from local model", async () => {
+  test("rerank cache key isolates RemoteJev from another configured model", async () => {
     const store = await createTestStore();
     const query = "jev cache isolation query";
     const docs = [{ file: "doc.md", text: "isolated chunk content" }];
@@ -1445,7 +1325,7 @@ describe("Caching", () => {
     const { RemoteJev } = await import("../src/remote-jev.js");
     const { Hybrid } = await import("../src/hybrid.js");
     const jev = new RemoteJev({ client: mockJevClient, model: "jev-1.13" });
-    const hybrid = new Hybrid(mockLocal, undefined, jev);
+    const hybrid = new Hybrid(undefined, jev);
 
     store.llm = hybrid as any;
 
@@ -1481,6 +1361,7 @@ describe("Caching", () => {
 describe("Query expansion cache (#818)", () => {
   test("passes expansion and rerank contexts to their own stages", async () => {
     const store = await createTestStore();
+    store.llm = { supportsExpand: true, supportsRerank: true, expandQuery: vi.fn(async () => { throw new Error("Unexpected uncached remote request"); }) } as any;
     const expandQuerySpy = vi.fn(async () => [{ type: "lex" as const, query: "charlie" }]);
     const rerankSpy = vi.fn(async (_query: string, docs: { file: string; text: string }[]) =>
       docs.map((doc) => ({ file: doc.file, score: 0.9 })),
@@ -1520,8 +1401,9 @@ describe("Query expansion cache (#818)", () => {
 
   test("expandQuery serves cached expansions without invoking the LLM", async () => {
     const store = await createTestStore();
+    store.llm = { supportsExpand: true, supportsRerank: true, expandQuery: vi.fn(async () => { throw new Error("Unexpected uncached remote request"); }) } as any;
     try {
-      const model = store.localLlm?.generateModelName ?? (store.llm as any)?.generateModelName ?? DEFAULT_QUERY_MODEL;
+      const model = (store.llm as any)?.generateModelName ?? DEFAULT_QUERY_MODEL;
       const seeded = [{ type: "lex", query: "seeded-term" }];
       store.setCachedResult(getCacheKey("expandQuery", { query: "cached question", model }), JSON.stringify(seeded));
 
@@ -1537,8 +1419,9 @@ describe("Query expansion cache (#818)", () => {
 
   test("expandQuery with includeHyde: false uses separate cache key", async () => {
     const store = await createTestStore();
+    store.llm = { supportsExpand: true, supportsRerank: true, expandQuery: vi.fn(async () => { throw new Error("Unexpected uncached remote request"); }) } as any;
     try {
-      const model = store.localLlm?.generateModelName ?? (store.llm as any)?.generateModelName ?? DEFAULT_QUERY_MODEL;
+      const model = (store.llm as any)?.generateModelName ?? DEFAULT_QUERY_MODEL;
       const seededFull = [{ type: "lex", query: "seeded-lex" }, { type: "hyde", query: "seeded-hyde" }];
       const seededNoHyde = [{ type: "lex", query: "seeded-lex-nohyde" }];
       store.setCachedResult(getCacheKey("expandQuery", { query: "cached question", model }), JSON.stringify(seededFull));
@@ -1556,13 +1439,14 @@ describe("Query expansion cache (#818)", () => {
 
   test("hybridQuery drops a cached expansion whose sub-queries contributed nothing", async () => {
     const store = await createTestStore();
+    store.llm = { supportsExpand: true, supportsRerank: true, expandQuery: vi.fn(async () => { throw new Error("Unexpected uncached remote request"); }) } as any;
     try {
       await insertTestDocument(store.db, "docs", {
         name: "alpha",
         title: "Alpha Bravo",
         body: "# Alpha\n\nalpha bravo charlie content.",
       });
-      const model = store.localLlm?.generateModelName ?? (store.llm as any)?.generateModelName ?? DEFAULT_QUERY_MODEL;
+      const model = (store.llm as any)?.generateModelName ?? DEFAULT_QUERY_MODEL;
       const cacheKey = getCacheKey("expandQuery", { query: "alpha bravo", model, expansionContext: "unrelated meta commentary" });
       store.setCachedResult(cacheKey, JSON.stringify([{ type: "lex", query: "zzzqqq wwwuuu" }]));
 
@@ -1580,13 +1464,14 @@ describe("Query expansion cache (#818)", () => {
 
   test("hybridQuery drops the no-HyDE cache entry when its expansions contribute nothing", async () => {
     const store = await createTestStore();
+    store.llm = { supportsExpand: true, supportsRerank: true, expandQuery: vi.fn(async () => { throw new Error("Unexpected uncached remote request"); }) } as any;
     try {
       await insertTestDocument(store.db, "docs", {
         name: "alpha",
         title: "Alpha Bravo",
         body: "# Alpha\n\nalpha bravo charlie content.",
       });
-      const model = store.localLlm?.generateModelName ?? (store.llm as any)?.generateModelName ?? DEFAULT_QUERY_MODEL;
+      const model = (store.llm as any)?.generateModelName ?? DEFAULT_QUERY_MODEL;
       const cacheKey = getCacheKey("expandQuery", {
         query: "alpha bravo",
         model,
@@ -1611,13 +1496,14 @@ describe("Query expansion cache (#818)", () => {
 
   test("hybridQuery keeps a cached expansion that contributed results", async () => {
     const store = await createTestStore();
+    store.llm = { supportsExpand: true, supportsRerank: true, expandQuery: vi.fn(async () => { throw new Error("Unexpected uncached remote request"); }) } as any;
     try {
       await insertTestDocument(store.db, "docs", {
         name: "alpha",
         title: "Alpha Bravo",
         body: "# Alpha\n\nalpha bravo charlie content.",
       });
-      const model = store.localLlm?.generateModelName ?? (store.llm as any)?.generateModelName ?? DEFAULT_QUERY_MODEL;
+      const model = (store.llm as any)?.generateModelName ?? DEFAULT_QUERY_MODEL;
       const cacheKey = getCacheKey("expandQuery", { query: "alpha bravo", model, expansionContext: "unrelated meta commentary" });
       store.setCachedResult(cacheKey, JSON.stringify([{ type: "lex", query: "charlie" }]));
 
@@ -3362,6 +3248,7 @@ describe("Index Status", () => {
     );
     completeEmbeddingBuild(store.db, lease);
 
+    store.embeddingProvider = { ...store.embeddingProvider!, model: activeModel };
     expect(store.getHashesNeedingEmbedding()).toBe(1);
     expect(store.getStatus().needsEmbedding).toBe(1);
     expect(store.getIndexHealth().needsEmbedding).toBe(1);
@@ -4027,225 +3914,7 @@ describe("Vector Search collection filter", () => {
 });
 
 // =============================================================================
-// LlamaCpp Integration Tests (using real local models)
-// =============================================================================
-
-describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
-  test("searchVec returns empty when no vector index", async () => {
-    const store = await createTestStore();
-    const collectionName = await createTestCollection();
-    await insertTestDocument(store.db, collectionName, {
-      name: "doc1",
-      body: "Some content",
-    });
-
-    // No vectors_vec table exists, should return empty
-    const results = await store.searchVec("query", "embeddinggemma", 10);
-    expect(results).toHaveLength(0);
-
-    await cleanupTestDb(store);
-  });
-
-  test("searchVec returns results when vector index exists", async () => {
-    const store = await createTestStore();
-    const collectionName = await createTestCollection();
-
-    const hash = "testhash123";
-    await insertTestDocument(store.db, collectionName, {
-      name: "doc1",
-      hash,
-      body: "Some content about testing",
-      filepath: "/test/doc1.md",
-      displayPath: "doc1.md",
-    });
-
-    const embedding = Array(768).fill(0).map(() => Math.random());
-    publishVectorFixtures(store, "embeddinggemma", [
-      { hash, embedding: new Float32Array(embedding) },
-    ]);
-
-    const results = await store.searchVec("test query", "embeddinggemma", 10);
-    expect(results).toHaveLength(1);
-    expect(results[0]!.displayPath).toBe(`${collectionName}/doc1.md`);
-    expect(results[0]!.filepath).toBe(`qmd://${collectionName}/doc1.md`);
-    expect(results[0]!.source).toBe("vec");
-
-    await cleanupTestDb(store);
-  });
-
-  test("searchVec filters by collection name", async () => {
-    const store = await createTestStore();
-    const collection1 = await createTestCollection({ name: "coll1", pwd: "/test/coll1" });
-    const collection2 = await createTestCollection({ name: "coll2", pwd: "/test/coll2" });
-
-    const hash1 = "hash1abc";
-    const hash2 = "hash2xyz";
-
-    await insertTestDocument(store.db, collection1, {
-      name: "doc1",
-      hash: hash1,
-      body: "Content in collection one",
-    });
-
-    await insertTestDocument(store.db, collection2, {
-      name: "doc2",
-      hash: hash2,
-      body: "Content in collection two",
-    });
-
-    const embedding1 = Array(768).fill(0).map(() => Math.random());
-    const embedding2 = Array(768).fill(0).map(() => Math.random());
-    publishVectorFixtures(store, "embeddinggemma", [
-      { hash: hash1, embedding: new Float32Array(embedding1) },
-      { hash: hash2, embedding: new Float32Array(embedding2) },
-    ]);
-
-    // Search without filter - should return both
-    const allResults = await store.searchVec("content", "embeddinggemma", 10);
-    expect(allResults).toHaveLength(2);
-
-    // Search with collection filter - should return only from collection1
-    const filtered = await store.searchVec("content", "embeddinggemma", 10, collection1);
-    expect(filtered).toHaveLength(1);
-    expect(filtered[0]!.collectionName).toBe(collection1);
-
-    await cleanupTestDb(store);
-  });
-
-  // Regression test for https://github.com/tobi/qmd/pull/23
-  // sqlite-vec virtual tables hang when combined with JOINs in the same query.
-  // The fix uses a two-step approach: vector query first, then separate JOINs.
-  test("searchVec uses two-step query to avoid sqlite-vec JOIN hang", async () => {
-    const store = await createTestStore();
-    const collectionName = await createTestCollection();
-
-    const hash = "regression_test_hash";
-    await insertTestDocument(store.db, collectionName, {
-      name: "regression-doc",
-      hash,
-      body: "Test content for vector search regression",
-      filepath: "/test/regression.md",
-      displayPath: "regression.md",
-    });
-
-    const embedding = Array(768).fill(0).map(() => Math.random());
-    publishVectorFixtures(store, "embeddinggemma", [
-      { hash, embedding: new Float32Array(embedding) },
-    ]);
-
-    // This should complete quickly (not hang) due to the two-step fix
-    // The old code with JOINs in the sqlite-vec query would hang indefinitely
-    const startTime = Date.now();
-    const results = await store.searchVec("test content", "embeddinggemma", 5);
-    const elapsed = Date.now() - startTime;
-
-    // If the query took more than 5 seconds, something is wrong
-    // (the hang bug would cause it to never return at all)
-    expect(elapsed).toBeLessThan(5000);
-    expect(results.length).toBeGreaterThan(0);
-
-    await cleanupTestDb(store);
-  });
-
-  test("expandQuery returns typed expansions (no original query)", async () => {
-    const store = await createTestStore();
-
-    const expanded = await store.expandQuery("test query");
-    // Returns ExpandedQuery[] — typed results from LLM, excluding original
-    expect(expanded.length).toBeGreaterThanOrEqual(1);
-    for (const q of expanded) {
-      expect(['lex', 'vec', 'hyde']).toContain(q.type);
-      expect(q.query.length).toBeGreaterThan(0);
-      expect(q.query).not.toBe("test query"); // original excluded
-    }
-
-    await cleanupTestDb(store);
-  }, 90000);
-
-  test("expandQuery caches results as JSON with types", async () => {
-    const store = await createTestStore();
-
-    // First call — hits LLM
-    const queries1 = await store.expandQuery("cached query test");
-    // Second call — hits cache
-    const queries2 = await store.expandQuery("cached query test");
-
-    // Cache should preserve full typed structure
-    expect(queries1).toEqual(queries2);
-    expect(queries2[0]?.type).toBeDefined();
-
-    await cleanupTestDb(store);
-  }, 60000);
-
-  test("rerank scores documents", async () => {
-    const store = await createTestStore();
-
-    const docs = [
-      { file: "doc1.md", text: "Relevant content about the topic" },
-      { file: "doc2.md", text: "Other content" },
-    ];
-
-    const results = await store.rerank("topic", docs);
-    expect(results).toHaveLength(2);
-    // LlamaCpp reranker returns relevance scores
-    expect(results[0]!.score).toBeGreaterThan(0);
-
-    await cleanupTestDb(store);
-  });
-
-  test("rerank caches results", async () => {
-    const store = await createTestStore();
-
-    const docs = [{ file: "doc1.md", text: "Content for caching test" }];
-
-    // First call
-    await store.rerank("cache test query", docs);
-    // Second call - should hit cache
-    const results = await store.rerank("cache test query", docs);
-
-    expect(results).toHaveLength(1);
-
-    await cleanupTestDb(store);
-  });
-
-  test("rerank deduplicates identical chunks across files", async () => {
-    const store = await createTestStore();
-    const rerankSpy = vi.fn(async (_query: string, docs: { file: string; text: string }[]) => ({
-      results: docs.map((doc, index) => ({
-        file: doc.file,
-        score: 1 - index * 0.1,
-        index,
-      })),
-      model: "mock-reranker",
-    }));
-
-    const llmSpy = vi.spyOn(llmModule, "getDefaultLlamaCpp").mockReturnValue({
-      rerank: rerankSpy,
-    } as any);
-
-    try {
-      const docs = [
-        { file: "doc1.md", text: "Shared chunk text" },
-        { file: "doc2.md", text: "Shared chunk text" },
-      ];
-
-      const first = await store.rerank("shared", docs);
-      const second = await store.rerank("shared", docs);
-
-      expect(first).toHaveLength(2);
-      expect(second).toHaveLength(2);
-      expect(rerankSpy).toHaveBeenCalledTimes(1);
-      expect(rerankSpy.mock.calls[0]?.[1]).toEqual([{ file: "doc2.md", text: "Shared chunk text" }]);
-    } finally {
-      llmSpy.mockRestore();
-      await cleanupTestDb(store);
-    }
-  });
-
-});
-
-// =============================================================================
-// Edge Cases & Error Handling
+// Edge cases
 // =============================================================================
 
 describe("Edge Cases", () => {
@@ -4349,433 +4018,7 @@ describe("Edge Cases", () => {
   });
 });
 
-describe("Embedding batching", () => {
-  function createFakeTokenizer() {
-    return {
-      async tokenize(text: string) {
-        return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
-      },
-    };
-  }
-
-  function createFakeEmbedLlm() {
-    const embedBatchCalls: string[][] = [];
-    const embedCalls: { text: string; options?: { model?: string } }[] = [];
-    const embedBatchModelCalls: ({ model?: string } | undefined)[] = [];
-    const tokenizeCalls: string[] = [];
-    return {
-      embedBatchCalls,
-      embedCalls,
-      embedBatchModelCalls,
-      tokenizeCalls,
-      async tokenize(text: string) {
-        tokenizeCalls.push(text);
-        return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
-      },
-      async detokenize(tokens: readonly number[]) {
-        return "x".repeat(tokens.length * 16);
-      },
-      async embed(text: string, options?: { model?: string }) {
-        embedCalls.push({ text, options });
-        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
-      },
-      async embedBatch(texts: string[], options?: { model?: string }) {
-        embedBatchCalls.push([...texts]);
-        embedBatchModelCalls.push(options);
-        return texts.map((_text, index) => ({
-          embedding: [index + 1, index + 2, index + 3],
-          model: "fake-embed",
-        }));
-      },
-    };
-  }
-
-  test("generateEmbeddings tokenizes with the store-local LLM", async () => {
-    const store = await createTestStore();
-    const fakeLlm = createFakeEmbedLlm();
-    const globalTokenize = vi.fn(async () => {
-      throw new Error("global tokenizer must not run");
-    });
-
-    setDefaultLlamaCpp({
-      tokenize: globalTokenize,
-      detokenize: async () => "",
-    } as any);
-    store.llm = fakeLlm as any;
-
-    try {
-      await insertTestDocument(store.db, "docs", {
-        name: "store-local-tokenizer",
-        body: "# Store-local tokenizer\n\nVerified model bytes own document tokenization.",
-      });
-
-      const result = await generateEmbeddings(store);
-
-      expect(result.chunksEmbedded).toBe(1);
-      expect(fakeLlm.tokenizeCalls.length).toBeGreaterThan(0);
-      expect(globalTokenize).not.toHaveBeenCalled();
-    } finally {
-      setDefaultLlamaCpp(null);
-      await cleanupTestDb(store);
-    }
-  });
-
-  test("legacy fingerprint adoption tokenizes with the store-local LLM", async () => {
-    const store = await createTestStore();
-    const fakeLlm = createFakeEmbedLlm();
-    const globalTokenize = vi.fn(async () => {
-      throw new Error("global tokenizer must not run");
-    });
-    const model = "hf:test/store-local-fingerprint.gguf";
-    const body = "# Legacy fingerprint\n\nVerified model bytes own legacy tokenization.";
-    const hash = await hashContent(body);
-
-    setDefaultLlamaCpp({
-      tokenize: globalTokenize,
-      detokenize: async () => "",
-    } as any);
-    store.llm = fakeLlm as any;
-
-    try {
-      await insertTestDocument(store.db, "docs", {
-        name: "store-local-fingerprint",
-        body,
-        hash,
-      });
-      store.ensureVecTable(3);
-      store.insertEmbedding(
-        hash,
-        0,
-        0,
-        new Float32Array([0.1, 0.2, 0.3]),
-        model,
-        new Date(0).toISOString(),
-        1,
-        "",
-      );
-
-      const result = await maybeAdoptLegacyEmbeddingFingerprint(store, model);
-
-      expect(result.checked).toBe(true);
-      expect(result.adopted).toBe(1);
-      expect(fakeLlm.tokenizeCalls.length).toBeGreaterThan(0);
-      expect(globalTokenize).not.toHaveBeenCalled();
-    } finally {
-      setDefaultLlamaCpp(null);
-      await cleanupTestDb(store);
-    }
-  });
-
-  test("generateEmbeddings flushes batches when maxDocsPerBatch is reached", async () => {
-    const store = await createTestStore();
-    const db = store.db;
-    const fakeLlm = createFakeEmbedLlm();
-
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = fakeLlm as any;
-
-    try {
-      await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
-      await insertTestDocument(db, "docs", { name: "two", body: "# Two\n\nBeta" });
-      await insertTestDocument(db, "docs", { name: "three", body: "# Three\n\nGamma" });
-
-      const result = await generateEmbeddings(store, {
-        maxDocsPerBatch: 1,
-        maxBatchBytes: 1024 * 1024,
-      });
-
-      expect(fakeLlm.embedBatchCalls).toHaveLength(3);
-      expect(fakeLlm.embedBatchCalls.map(call => call.length)).toEqual([1, 1, 1]);
-      expect(result.docsProcessed).toBe(3);
-      expect(result.chunksEmbedded).toBe(3);
-      expect(db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get()).toEqual({ count: 3 });
-    } finally {
-      setDefaultLlamaCpp(null);
-      await cleanupTestDb(store);
-    }
-  });
-
-  test("generateEmbeddings stops early when maxDurationMs is exceeded", async () => {
-    const store = await createTestStore();
-    const db = store.db;
-    // A slow embedder so the short session cap trips between document batches.
-    const embedBatchCalls: string[][] = [];
-    const slowLlm = {
-      ...createFakeTokenizer(),
-      async embed() { return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" }; },
-      async embedBatch(texts: string[]) {
-        embedBatchCalls.push([...texts]);
-        await new Promise((resolve) => setTimeout(resolve, 80));
-        return texts.map((_text, index) => ({ embedding: [index + 1, index + 2, index + 3], model: "fake-embed" }));
-      },
-    };
-
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = slowLlm as any;
-
-    try {
-      await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
-      await insertTestDocument(db, "docs", { name: "two", body: "# Two\n\nBeta" });
-      await insertTestDocument(db, "docs", { name: "three", body: "# Three\n\nGamma" });
-
-      const result = await generateEmbeddings(store, {
-        maxDocsPerBatch: 1,           // one doc per batch, so the cap can stop between docs
-        maxBatchBytes: 1024 * 1024,
-        maxDurationMs: 10,            // trips ~10ms in, well before the 80ms batches finish
-      });
-
-      // The first batch runs, then the session expires and the rest are skipped.
-      expect(embedBatchCalls.length).toBeGreaterThanOrEqual(1);
-      expect(embedBatchCalls.length).toBeLessThan(3);
-      expect(result.chunksEmbedded).toBeLessThan(3);
-    } finally {
-      setDefaultLlamaCpp(null);
-      await cleanupTestDb(store);
-    }
-  });
-
-  test("generateEmbeddings flushes batches when maxBatchBytes is reached", async () => {
-    const store = await createTestStore();
-    const db = store.db;
-    const fakeLlm = createFakeEmbedLlm();
-
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = fakeLlm as any;
-
-    const docOne = "# One\n\n" + "A".repeat(36);
-    const docTwo = "# Two\n\n" + "B".repeat(36);
-    const docThree = "# Three\n\n" + "C".repeat(36);
-    const batchLimit = new TextEncoder().encode(docOne).length
-      + new TextEncoder().encode(docTwo).length
-      + 1;
-
-    try {
-      await insertTestDocument(db, "docs", { name: "a-one", body: docOne });
-      await insertTestDocument(db, "docs", { name: "b-two", body: docTwo });
-      await insertTestDocument(db, "docs", { name: "c-three", body: docThree });
-
-      const result = await generateEmbeddings(store, {
-        maxDocsPerBatch: 64,
-        maxBatchBytes: batchLimit,
-      });
-
-      expect(fakeLlm.embedBatchCalls).toHaveLength(2);
-      expect(fakeLlm.embedBatchCalls.map(call => call.length)).toEqual([2, 1]);
-      expect(result.docsProcessed).toBe(3);
-      expect(result.chunksEmbedded).toBe(3);
-    } finally {
-      setDefaultLlamaCpp(null);
-      await cleanupTestDb(store);
-    }
-  });
-
-  test("generateEmbeddings passes the selected model through to embed calls and metadata", async () => {
-    const store = await createTestStore();
-    const db = store.db;
-    const fakeLlm = createFakeEmbedLlm();
-    const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
-
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = fakeLlm as any;
-
-    try {
-      await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
-
-      const result = await generateEmbeddings(store, { model });
-
-      expect(result.chunksEmbedded).toBe(1);
-      expect(fakeLlm.embedCalls[0]?.options?.model).toBe(model);
-      expect(fakeLlm.embedBatchModelCalls).toEqual([{ model }]);
-      expect(db.prepare(`SELECT DISTINCT model FROM content_vectors`).all()).toEqual([{ model }]);
-    } finally {
-      setDefaultLlamaCpp(null);
-      await cleanupTestDb(store);
-    }
-  });
-
-  test("generateEmbeddings uses the active llm embed model when no explicit model is passed", async () => {
-    const store = await createTestStore();
-    const db = store.db;
-    const fakeLlm = createFakeEmbedLlm();
-    const model = "hf:env/embed-model.gguf";
-
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = { ...fakeLlm, embedModelName: model } as any;
-
-    try {
-      await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
-
-      const result = await generateEmbeddings(store);
-
-      expect(result.chunksEmbedded).toBe(1);
-      expect(fakeLlm.embedCalls[0]?.options?.model).toBe(model);
-      expect(fakeLlm.embedBatchModelCalls).toEqual([{ model }]);
-      expect(db.prepare(`SELECT DISTINCT model FROM content_vectors`).all()).toEqual([{ model }]);
-    } finally {
-      setDefaultLlamaCpp(null);
-      await cleanupTestDb(store);
-    }
-  });
-
-  test("generateEmbeddings does not mark a partially embedded multi-chunk document complete", async () => {
-    const store = await createTestStore();
-    const db = store.db;
-    let embedCalls = 0;
-    const fakeLlm = {
-      ...createFakeTokenizer(),
-      async embed(_text: string, _options?: { model?: string }) {
-        embedCalls++;
-        return embedCalls === 1
-          ? { embedding: [0.1, 0.2, 0.3], model: "fake-embed" }
-          : null;
-      },
-      async embedBatch(texts: string[], _options?: { model?: string }) {
-        return texts.map((_text, index) => index === 0
-          ? { embedding: [1, 2, 3], model: "fake-embed" }
-          : null
-        );
-      },
-    };
-
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = fakeLlm as any;
-
-    try {
-      await insertTestDocument(db, "docs", {
-        name: "long-doc",
-        body: "# Long doc\n\n" + "partial embedding regression ".repeat(260),
-      });
-
-      const result = await generateEmbeddings(store);
-
-      expect(result.errors).toBeGreaterThan(0);
-      expect(result.failures?.[0]?.attempts).toBe(3);
-      expect(db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get()).toEqual({ count: 1 });
-      expect(db.prepare(`SELECT COUNT(*) as count FROM vectors_vec`).get()).toEqual({ count: 1 });
-      expect(store.getHashesNeedingEmbedding()).toBe(1);
-      expect(store.getStatus().needsEmbedding).toBe(1);
-    } finally {
-      setDefaultLlamaCpp(null);
-      await cleanupTestDb(store);
-    }
-  });
-
-  test("generateEmbeddings clears chunk errors after successful retry", async () => {
-    const store = await createTestStore();
-    const db = store.db;
-    const fakeLlm = {
-      ...createFakeTokenizer(),
-      async embed(_text: string, _options?: { model?: string }) {
-        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
-      },
-      async embedBatch(texts: string[], _options?: { model?: string }) {
-        return texts.map((_text, index) => index === 0
-          ? { embedding: [1, 2, 3], model: "fake-embed" }
-          : null
-        );
-      },
-    };
-
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = fakeLlm as any;
-
-    try {
-      await insertTestDocument(db, "docs", {
-        name: "retry-doc",
-        body: "# Retry doc\n\n" + "transient embedding failure ".repeat(260),
-      });
-
-      const result = await generateEmbeddings(store);
-
-      expect(result.errors).toBe(0);
-      expect(result.failures).toEqual([]);
-      expect(db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get()).toEqual({ count: result.chunksEmbedded });
-      expect(store.getHashesNeedingEmbedding()).toBe(0);
-    } finally {
-      setDefaultLlamaCpp(null);
-      await cleanupTestDb(store);
-    }
-  });
-
-  test("generateEmbeddings opens a long-lived LLM session for embed runs", async () => {
-    const store = await createTestStore();
-    const fakeLlm = createFakeEmbedLlm();
-    const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
-
-    setDefaultLlamaCpp(createFakeTokenizer() as any);
-    store.llm = fakeLlm as any;
-
-    try {
-      await insertTestDocument(store.db, "docs", { name: "one", body: "# One\n\nAlpha" });
-
-      await generateEmbeddings(store);
-
-      expect(sessionSpy).toHaveBeenCalledWith(
-        fakeLlm,
-        expect.any(Function),
-        expect.objectContaining({ maxDuration: 30 * 60 * 1000, name: "generateEmbeddings" }),
-      );
-    } finally {
-      sessionSpy.mockRestore();
-      setDefaultLlamaCpp(null);
-      await cleanupTestDb(store);
-    }
-  });
-
-  test("searchVec embeds the query with the store's pinned llm, not the global default (#690)", async () => {
-    const store = await createTestStore();
-    const db = store.db;
-
-    // Store is pinned to a 3-dim embed model. Docs AND the query must use it,
-    // so vectors_vec is created as float[3].
-    const storeModel = "hf:store/embeddinggemma-300M.gguf";
-    const storeLlm = {
-      ...createFakeTokenizer(),
-      embedModelName: storeModel,
-      async embed(_text: string, _options?: { model?: string }) {
-        return { embedding: [0.1, 0.2, 0.3], model: storeModel };
-      },
-      async embedBatch(texts: string[], _options?: { model?: string }) {
-        return texts.map(() => ({ embedding: [0.1, 0.2, 0.3], model: storeModel }));
-      },
-    };
-
-    // The global default (env QMD_EMBED_MODEL) is a DIFFERENT, 4-dim model.
-    // If the query is wrongly embedded with this, sqlite-vec rejects the 4-dim
-    // vector against the float[3] table (the reported dim-mismatch symptom).
-    let defaultEmbedCalls = 0;
-    const defaultLlm = {
-      // Chunking tokenizes via the global default (chunkDocumentByTokens passes
-      // no tokenizer), so the default must provide tokenize.
-      async tokenize(text: string) {
-        return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
-      },
-      async embed(_text: string, _options?: { model?: string }) {
-        defaultEmbedCalls++;
-        return { embedding: [9, 9, 9, 9], model: "env-8b" };
-      },
-    };
-
-    setDefaultLlamaCpp(defaultLlm as any);
-    store.llm = storeLlm as any;
-
-    try {
-      await insertTestDocument(db, "docs", { name: "alpha", body: "# Alpha\n\nvector regression doc" });
-      const embed = await generateEmbeddings(store);
-      expect(embed.chunksEmbedded).toBeGreaterThan(0);
-
-      // Inline-embed path (no session, no precomputed embedding): the query must
-      // be embedded with the store's llm. Pre-fix this threw a dim mismatch.
-      const results = await store.searchVec("find alpha", storeModel);
-
-      expect(results.length).toBeGreaterThan(0);
-      expect(defaultEmbedCalls).toBe(0);
-    } finally {
-      setDefaultLlamaCpp(null);
-      await cleanupTestDb(store);
-    }
-  });
-
+describe("Remote query routing", () => {
   test("vectorSearchQuery uses the active llm embed model for vector lookups", async () => {
     const store = await createTestStore();
     const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
@@ -4974,182 +4217,10 @@ describe("Embedding batching", () => {
         "maxBatchBytes"
       );
     } finally {
-      setDefaultLlamaCpp(null);
       await cleanupTestDb(store);
     }
   });
 });
-
-describe("Token chunking guardrails", () => {
-  test("chunkDocumentByTokens keeps pathological single-line blobs under the token limit", async () => {
-    setDefaultLlamaCpp({
-      async tokenize(text: string) {
-        return Array.from({ length: text.length }, () => 1);
-      },
-      async detokenize(tokens: readonly number[]) {
-        return "x".repeat(tokens.length);
-      },
-    } as any);
-
-    try {
-      const chunks = await chunkDocumentByTokens("x".repeat(1200), 100, 15, 20);
-
-      expect(chunks.length).toBeGreaterThan(1);
-      expect(chunks.every((chunk) => chunk.tokens <= 100)).toBe(true);
-      for (let i = 1; i < chunks.length; i++) {
-        expect(chunks[i]!.pos).toBeGreaterThan(chunks[i - 1]!.pos);
-      }
-    } finally {
-      setDefaultLlamaCpp(null);
-    }
-  });
-
-  test("chunkDocumentByTokens keeps surrogate pairs intact when the token budget shrinks the char budget below 2", async () => {
-    // A tokenizer that reports one token per UTF-16 code unit makes
-    // astral-plane content (emoji) look 2x as "expensive" as it actually
-    // is, driving pushChunkWithinTokenLimit's recursive safeMaxChars
-    // calculation down to 1 char — exactly the case that used to make
-    // chunkDocument() slice a surrogate pair in half.
-    setDefaultLlamaCpp({
-      async tokenize(text: string) {
-        return Array.from({ length: text.length }, () => 1);
-      },
-      async detokenize(tokens: readonly number[]) {
-        return "x".repeat(tokens.length);
-      },
-    } as any);
-
-    try {
-      const content = "\u{1F680}".repeat(30); // 30 emoji, 60 UTF-16 code units
-      const chunks = await chunkDocumentByTokens(content, 2, 0, 0);
-
-      expect(chunks.length).toBeGreaterThan(1);
-      for (const chunk of chunks) {
-        expect(chunk.text.isWellFormed()).toBe(true);
-      }
-    } finally {
-      setDefaultLlamaCpp(null);
-    }
-  });
-
-  test("chunkDocumentByTokens drops rather than emits an unpaired surrogate from the detokenize() truncation fallback", async () => {
-    // Simulates a tokenizer that encodes a single astral-plane character
-    // across multiple tokens and, when the truncation fallback slices the
-    // token list down to a single token, detokenizes it back into a lone
-    // high surrogate — the shape a real BPE-style tokenizer can produce.
-    // This exercises the results.push() site fed by llm.detokenize()
-    // rather than by chunkDocument()'s char-slicing.
-    setDefaultLlamaCpp({
-      async tokenize(text: string) {
-        return Array.from({ length: text.length }, () => 1);
-      },
-      async detokenize(tokens: readonly number[]) {
-        return tokens.length === 1 ? "\uD83D" : "\u{1F680}".repeat(Math.ceil(tokens.length / 2));
-      },
-    } as any);
-
-    try {
-      const chunks = await chunkDocumentByTokens("\u{1F680}", 1, 0, 0);
-
-      // A single emoji at maxTokens=1 has no valid within-budget
-      // representation once the malformed detokenize() output is
-      // stripped, so the safety net drops it entirely rather than
-      // emitting a broken fragment. Asserting the exact count (rather
-      // than leaving it unchecked) makes that intentional outcome
-      // explicit and avoids a vacuous pass on an empty array.
-      expect(chunks.length).toBe(0);
-      for (const chunk of chunks) {
-        expect(chunk.text.isWellFormed()).toBe(true);
-      }
-    } finally {
-      setDefaultLlamaCpp(null);
-    }
-  });
-
-  test("chunkDocumentByTokens drops rather than emits an already-malformed lone surrogate from source content", async () => {
-    // Defense-in-depth for the text.length <= 1 base case: a bare lone
-    // surrogate that was already malformed in the source document (e.g.
-    // from an unrelated upstream encoding bug) should never reach the
-    // embedding pipeline as a 1-character chunk.
-    setDefaultLlamaCpp({
-      async tokenize(text: string) {
-        return Array.from({ length: text.length }, () => 1);
-      },
-      async detokenize(tokens: readonly number[]) {
-        return "x".repeat(tokens.length);
-      },
-    } as any);
-
-    try {
-      const chunks = await chunkDocumentByTokens("\uD800", 900, 135);
-
-      expect(chunks.length).toBe(0);
-    } finally {
-      setDefaultLlamaCpp(null);
-    }
-  });
-
-  test("chunkDocumentByTokens strips a lone high surrogate that lands at an ordinary chunk's leading edge", async () => {
-    // The lone high surrogate is already malformed in the source content
-    // (not produced by chunking) and happens to fall exactly on a normal,
-    // non-degenerate chunk boundary — reached via the plain base case
-    // (tokens.length <= maxTokens on the first try), not the recursive
-    // re-split or single-character-chunk paths already covered above.
-    setDefaultLlamaCpp({
-      async tokenize(text: string) {
-        return Array.from({ length: Math.ceil(text.length / 3) }, () => 1);
-      },
-      async detokenize(tokens: readonly number[]) {
-        return "x".repeat(tokens.length);
-      },
-    } as any);
-
-    try {
-      // maxChars = maxTokens(10) * avgCharsPerToken(3) = 30, so the first
-      // chunk boundary lands at index 30 — exactly where the lone high
-      // surrogate sits, making it the leading character of chunk 2.
-      const content = "x".repeat(30) + "\uD800" + "y".repeat(29);
-      const chunks = await chunkDocumentByTokens(content, 10, 0, 0);
-
-      expect(chunks.length).toBeGreaterThan(1);
-      for (const chunk of chunks) {
-        expect(chunk.text.isWellFormed()).toBe(true);
-      }
-    } finally {
-      setDefaultLlamaCpp(null);
-    }
-  });
-
-  test("chunkDocumentByTokens strips a lone low surrogate that lands at an ordinary chunk's trailing edge", async () => {
-    // Mirror of the leading-high case: a lone low surrogate already
-    // malformed in the source content falls exactly at the end of the
-    // first chunk, reached via the same plain base case.
-    setDefaultLlamaCpp({
-      async tokenize(text: string) {
-        return Array.from({ length: Math.ceil(text.length / 3) }, () => 1);
-      },
-      async detokenize(tokens: readonly number[]) {
-        return "x".repeat(tokens.length);
-      },
-    } as any);
-
-    try {
-      const content = "x".repeat(29) + "\uDC00" + "y".repeat(30);
-      const chunks = await chunkDocumentByTokens(content, 10, 0, 0);
-
-      expect(chunks.length).toBeGreaterThan(1);
-      for (const chunk of chunks) {
-        expect(chunk.text.isWellFormed()).toBe(true);
-      }
-    } finally {
-      setDefaultLlamaCpp(null);
-    }
-  });
-});
-
-// =============================================================================
-// Content-Addressable Storage Tests
-// =============================================================================
 
 describe("Content-Addressable Storage", () => {
   test("same content gets same hash from multiple collections", async () => {

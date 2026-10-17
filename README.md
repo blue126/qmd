@@ -1,8 +1,8 @@
 # QMD - Query Markup Documents
 
-An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
+A search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
 
-QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
+QMD keeps documents, SQLite, BM25, CJK analysis, and AST chunking local. Vector embeddings, query expansion, and reranking use explicitly configured remote APIs; this build contains no local model inference or model downloads.
 
 ```mermaid
 flowchart LR
@@ -25,7 +25,7 @@ Typed expansions are routed exclusively: `lex` → BM25/FTS, `vec` and `hyde` �
 
 You can read more about QMD's progress in the [CHANGELOG](CHANGELOG.md).
 
-## Quick Start (Local Embedding Default)
+## Quick Start (Remote Models)
 
 ```sh
 # Install globally
@@ -46,7 +46,7 @@ qmd context add qmd://notes "Personal notes and ideas"
 qmd context add qmd://meetings "Meeting transcripts and notes"
 qmd context add qmd://docs "Work documentation"
 
-# Generate embeddings for semantic search
+# Configure remote model APIs as shown below, then explicitly generate vectors
 qmd embed
 
 # Search across everything
@@ -158,7 +158,7 @@ host check and warns at startup. Set `QMD_ALLOWED_HOSTS` to re-enable it, and
 remember the endpoints are unauthenticated — put your own auth in front of a
 server that is reachable off-host.
 
-LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and transparently recreated on the next request (~1s penalty, models remain loaded).
+MCP uses remote API clients for model operations. It does not load models into local RAM or VRAM.
 
 Point any MCP client at `http://localhost:8181/mcp` to connect.
 
@@ -216,7 +216,7 @@ const store = await createStore({
   },
 })
 
-const results = await store.search({ query: "authentication flow" })
+const results = await store.searchLex("authentication flow")
 console.log(results.map(r => `${r.title} (${Math.round(r.score * 100)}%)`))
 
 await store.close()
@@ -443,7 +443,7 @@ import {
 #### Lifecycle
 
 ```typescript
-// Close the store — disposes LLM models and DB connection
+// Close the store — releases remote clients and the DB connection
 await store.close()
 ```
 
@@ -522,7 +522,7 @@ The SDK requires explicit `dbPath` — no defaults are assumed. This makes it sa
 
 The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware blending:
 
-1. **Query Expansion Policy**: `auto` expands eligible queries with a local generator but skips remote generation; `force` runs the configured generator; `skip` uses only the original query. Original FTS and vector retrieval paths have ×2 RRF weight in every mode. When expansion runs, QMD adds zero or more typed LLM variants at ×1: `lex` variants use FTS, while `vec` and `hyde` variants use vector search.
+1. **Query Expansion Policy**: `auto` uses the configured remote generator subject to the shared expansion policy; `force` runs the configured generator; `skip` uses only the original query. Original FTS and vector retrieval paths have ×2 RRF weight in every mode. When expansion runs, QMD adds zero or more typed LLM variants at ×1: `lex` variants use FTS, while `vec` and `hyde` variants use vector search.
 2. **Parallel Retrieval**: The original query searches both indexes; `lex` variants search FTS, while `vec` and `hyde` variants search the vector index
 3. **RRF Fusion**: Combine all result lists using `score = Σ(1/(k+rank+1))` where k=60
 4. **Top-Rank Bonus**: Documents ranking #1 in any list get +0.05, #2-3 get +0.02
@@ -548,51 +548,50 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
 
 ### System Requirements
 
-- **Node.js** >= 22
+- **Node.js** >= 24.21.0
 - **macOS**: Homebrew SQLite (for extension support)
   ```sh
   brew install sqlite
   ```
 
-### GGUF Models (via node-llama-cpp)
+### Remote-only review build
 
-QMD uses three local GGUF models (auto-downloaded on first use):
+`2026.10.18-remote.0` is an unpublished review build. There is no bundled or
+automatically downloaded inference model and no GPU runtime to configure.
+BM25 (`qmd search`), document reads, collection/context management, and maintenance
+work without model configuration. Semantic operations require remote model APIs.
+`qmd pull` is retired: it prints migration guidance and exits nonzero without
+network access or downloads.
 
-| Model | Purpose | Size |
-|-------|---------|------|
-| `embeddinggemma-300M-Q8_0` | Vector embeddings (default) | ~300MB |
-| `qwen3-reranker-0.6b-q8_0` | Re-ranking | ~640MB |
-| `qmd-query-expansion-1.7B-q4_k_m` | Query expansion (fine-tuned) | ~1.1GB |
+Existing local-model databases remain readable through BM25 and document tools.
+QMD does not rewrite old vectors or silently send their documents to a provider.
+To use remote vectors, configure the desired remote model and run an explicit
+`qmd embed --force` after reviewing the provider and data boundary. This clears
+and rebuilds vectors as a user-requested operation; lexical content is retained.
 
-Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
+### Breaking SDK changes
 
-### Custom Embedding Model
+The supported package entry remains `createStore()` with the existing remote
+`config.models` fields. Local-model execution through `embed`, vector search,
+expansion, and reranking is retired: missing remote settings now fail explicitly.
+Model-free callers should use `searchLex()` or explicit lexical queries with
+`rerank: false` and expansion skipped; model-backed queries never silently skip
+required expansion or reranking.
 
-Override the default local embedding model via the `QMD_EMBED_MODEL` environment variable.
-
-```sh
-# Use another local GGUF embedding model
-export QMD_EMBED_MODEL="hf:org/model/repo-file.gguf"
-
-# After changing the model, re-embed all collections:
-qmd embed -f
-```
-
-Supported model families:
-- **embeddinggemma** (default) — Smaller local model
-- **Qwen3-Embedding** — Multilingual, including CJK
-
-> **Note:** When switching embedding models, you must re-index with `qmd embed -f`
-> since vectors are not cross-compatible between models. The prompt format is
-> automatically adjusted for each model family.
+Code importing implementation modules must migrate away from `LlamaCpp`,
+`LlamaCppConfig`, `LocalEmbeddingProvider`, `LocalEmbeddingProviderOwner`,
+`withLLMSession`, the default-Llama singleton helpers, `pullModels`, GGUF/cache
+inspection, GPU helpers, and local tokenization APIs. They are removed, as is
+`store.internal.localLlm`. Shared model types and pure formatting helpers remain
+separate from inference; scoped sessions require an explicit remote owner.
+Existing local identity labels remain diagnostic data, not executable providers.
 
 ### Remote Embedding & Models Configuration (Explicit Opt-in)
 
-QMD stays local by default. To use remote embeddings or remote LLM models, configure them in `index.yml` under the unified `models:` section.
+Configure remote embeddings and remote LLM models in `index.yml` under the unified `models:` section. Configuration alone sends no requests; embedding builds and model-backed searches are explicit operations.
 
 ```yaml
 models:
-  embed: hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf
   # Remote embeddings: set both embed_api_url (or embed_url / embed_base_url) and embed_api_model.
   # Provider is auto-detected from the model name / URL (voyage* → voyageai, otherwise openai-compatible).
   # Optional override: embed_provider: voyageai | openai
@@ -666,7 +665,7 @@ qmd embed
 
 > **CLI, SDK & MCP Integration:** Remote LLM query expansion and LLM Chat Reranking are automatically wired into CLI (`qmd query`), SDK (`createStore`), and MCP. Query expansion automatically enforces query language & script consistency (e.g., Traditional Chinese queries generate Traditional Chinese `lex`, `vec`, and `hyde` variations). LLM Chat Reranking features prompt-tail Recency Enforcement and strict JSON sanitization to ensure safe execution with any remote LLM backend.
 
-`qmd init` writes local defaults only; it does not prompt for or generate a remote embedding configuration. To use a remote endpoint, edit `index.yml` manually and set credentials when required.
+`qmd init` writes index and collection defaults only; it does not prompt for or generate model configuration. To use a remote endpoint, edit `index.yml` manually and set credentials when required.
 
 > **API Key Note:** Remote embeddings require both an embedding endpoint (`embed_url`, `embed_base_url`, or `embed_api_url`) and `embed_api_model` (unless `embed_provider: voyageai` supplies the Voyage default model/URL). Official OpenAI needs `OPENAI_API_KEY`; official Voyage needs `VOYAGE_API_KEY`. Custom OpenAI-compatible proxies may omit a key when the upstream is keyless. For Voyage-shaped traffic through a custom proxy only, `OPENAI_API_KEY` may fill in when `VOYAGE_API_KEY` is unset — never for `https://api.voyageai.com/v1`. QMD never writes keys to SQLite, diagnostics, logs, or error messages.
 
@@ -718,8 +717,7 @@ payloads, credentials, and sensitive URLs; identity and lease state are
 revalidated inside SQLite write locks before vectors are cleared or published.
 
 Remote LLM routing is independent per operation: expansion and reranking may each
-use a remote endpoint while embeddings remain local. A remote LLM failure can fall
-back to the corresponding local LlamaCpp operation without interrupting a search;
+use separately configured remote endpoints. Remote failures do not fall back to local inference;
 dedicated `/v1/rerank` endpoints that return HTTP 404 fall back to structured Chat
 Completions reranking. This fallback does not apply to remote embeddings.
 
@@ -745,7 +743,7 @@ channel contributions and tie-breakers.
 
 Query expansion uses one shared `auto | force | skip` policy across CLI, SDK, and
 MCP. Precedence is: explicit skip or `lex:` skips expansion; explicit force,
-`expand:`, or `--expand` forces it; under `auto`, CJK queries skip local model expansion (0ms bypass) but automatically expand when a remote LLM (`generate_api_url`) is configured; strong lexical
+`expand:`, or `--expand` forces it; under `auto`, eligible queries expand when a remote LLM (`generate_api_url`) is configured; strong lexical
 signals skip expansion, and remaining queries expand. Expanded queries automatically maintain language consistency with the user query.
 
 #### CJK index publication and recovery
@@ -921,13 +919,15 @@ global_context: "Knowledge base for my projects"
 # Overridden by the QMD_EDITOR_URI env var. See "Editor Links" below.
 editor_uri: "vscode://file{path}:{line}:{col}"
 
-# Override the default GGUF models per role. Optional — omit to use the
-# built-in defaults. `qmd init` writes this block pre-filled with the
-# resolved defaults. See "Model Configuration" for the default URIs.
+# Remote models are optional for BM25 and document reads.
 models:
-  embed: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf"
-  rerank: "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf"
-  generate: "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf"
+  embed_api_url: https://api.openai.com/v1
+  embed_api_model: text-embedding-3-small
+  embed_dimension: 1536
+  generate_api_url: https://api.example.com/v1
+  generate_api_model: your-expansion-model
+  rerank_api_url: https://api.example.com/v1/rerank
+  rerank_api_model: your-reranker
 
 # One entry per collection. The key is the collection name.
 collections:
@@ -948,7 +948,7 @@ collections:
 |-----|-------|---------|
 | `global_context` | top-level | Context prepended for every collection. Set via `qmd context add /`. |
 | `editor_uri` (alias `editor_uri_template`) | top-level | Hyperlink template for clickable result paths; `QMD_EDITOR_URI` overrides. |
-| `models.embed` / `.rerank` / `.generate` | top-level | HuggingFace GGUF URIs (`hf:<user>/<repo>/<file>`) overriding the built-in defaults per role. |
+| `models.embed` / `.rerank` / `.generate` | top-level | Legacy model identity fields retained for diagnostics; local inference is retired. Configure remote `*_api_*` fields instead. |
 | `collections.<name>.path` | per-collection | Absolute directory to index. |
 | `collections.<name>.pattern` | per-collection | Glob mask. Set via `qmd collection add --mask`. Default `**/*.md`. Comma-separated lists and brace groups (`{a,b}`) are a union of patterns. |
 | `collections.<name>.ignore` | per-collection | Glob patterns excluded from indexing — useful to stop nested collections double-indexing. **YAML-only — no CLI command sets this.** Additive with QMD's built-in exclusions (`node_modules`, `.git`, `.cache`, `vendor`, `dist`, `build`), which you cannot un-ignore. |
@@ -958,7 +958,8 @@ collections:
 
 > **Note:** Editing `index.yml` changes which directories and models QMD *uses*,
 > but does not re-index on its own. Run `qmd update` after changing `path`,
-> `pattern`, or `ignore`, and `qmd embed` after changing `models.embed`.
+> `pattern`, or `ignore`. Changing remote embedding identity requires the explicit
+> whole-index rebuild described above; legacy `models.embed` no longer enables inference.
 
 #### Automatic update commands
 
@@ -1000,10 +1001,10 @@ reach outside the project, and QMD will not use them unattended:
 - `update` commands — somebody else's shell script, run by `qmd update`
 - `collections.*.path` pointing **outside** the project directory
 - `models.embed` / `models.rerank` / `models.generate` other than the built-in
-  defaults (any `hf:` repo or local GGUF path)
+  defaults (legacy model identity fields)
 
 In-project collection paths (for example `./docs`) still index. On a terminal
-`qmd update` (and `qmd embed` / `qmd pull` / `qmd query`) lists the gated
+`qmd update` (and `qmd embed` / `qmd query`) lists the gated
 fields and asks. Approving records the approval in `~/.config/qmd/trusted.json`.
 With no terminal to ask — agents, CI, MCP — those fields are **skipped** and
 in-project indexing continues.
@@ -1062,7 +1063,7 @@ and `deep-search` (→ `query`).
 --filter <json>    # Metadata filter (recursive JSON AST; see Metadata Filtering)
 --index <name>     # Use named index
 --intent "<text>"  # Legacy CLI alias for rerank context (e.g. "web page load times")
---no-rerank        # Skip LLM reranking (RRF scores only; faster on CPU)
+--no-rerank        # Skip remote reranking (RRF scores only)
 -C, --candidate-limit <n>  # Max candidates to rerank (default: 40)
 --full-path        # Emit on-disk filesystem paths instead of qmd:// URIs
                    # (a result whose file has moved or been deleted since
@@ -1283,7 +1284,7 @@ qmd status
 # (e.g. `git pull`), it runs first — set one with `qmd collection update-cmd`.
 qmd update
 
-# Diagnose the install (runtime, sqlite-vec, embedding fingerprints, GPU probe)
+# Diagnose the install (runtime, sqlite-vec, embedding fingerprints, remote configuration)
 qmd doctor
 
 # Initialize a project-local index in the current directory
@@ -1413,9 +1414,6 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
 | `XDG_CONFIG_HOME` | `~/.config` | Config directory location (where `index.yml` lives) |
 | `QMD_CONFIG_DIR` | unset | Override the config directory outright (takes precedence over `XDG_CONFIG_HOME`) |
-| `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
-| `QMD_FORCE_CPU` | unset | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`. |
-| `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
 
 ## How It Works
 
@@ -1439,7 +1437,7 @@ Collection ──► Glob Pattern ──► Markdown Files ──► Parse Title
 Documents are chunked into ~900-token pieces with 15% overlap using smart boundary detection:
 
 ```
-Document ──► Smart Chunk (~900 tokens) ──► Format each chunk ──► node-llama-cpp ──► Store Vectors
+Document ──► Smart Chunk (~900 tokens) ──► Format each chunk ──► Remote Embedding API ──► Store Vectors
                 │                           "title | text"        embedBatch()
                 │
                 └─► Chunks stored with:
@@ -1531,35 +1529,16 @@ Original query (×2)                 Zero or more typed variants (×1)
 
 ## Model Configuration
 
-The default models are defined in `src/llm.ts` as HuggingFace URIs:
+Use `models.embed_api_url`, `embed_api_model`, and `embed_dimension` for
+OpenAI-compatible embeddings, or the dedicated Voyage settings above. Configure
+`generate_api_*` for expansion and `rerank_api_*` for reranking. TypeSafe Jev
+remains available through `models.jev_*` and its documented environment variables.
+Credentials belong in the process environment or an explicitly managed config;
+do not commit them. There are no local-model defaults for new configurations.
 
-```typescript
-const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
-const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
-const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
-```
-
-Override them per-role without touching source via the `models:` block in
-`index.yml` (see [Configuring `index.yml`](#configuring-indexyml)) or the
-`QMD_EMBED_MODEL` env var. Re-run `qmd embed` after changing the embedding model.
-
-### EmbeddingGemma Prompt Format
-
-```
-// For queries
-"task: search result | query: {query}"
-
-// For documents
-"title: {title} | text: {content}"
-```
-
-### Qwen3-Reranker
-
-Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross-encoder reranking. Returns documents sorted by relevance score (0.0 - 1.0).
-
-### Qwen3 (Query Expansion)
-
-Used for generating query variations via `LlamaChatSession`.
+Query expansion and reranking can be disabled independently. Use `qmd search`
+for model-free lexical retrieval. SDK and MCP clients can use explicit lexical
+searches with `rerank: false` and expansion skipped.
 
 ## License
 

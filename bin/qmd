@@ -17,30 +17,6 @@ const pkgDir = resolve(dirname(self), "..");
 const jsEntry = resolve(pkgDir, "dist/cli/qmd.js");
 const tsEntry = resolve(pkgDir, "src/cli/qmd.ts");
 
-// MCP stdio reserves stdout exclusively for JSON-RPC frames. node-llama-cpp
-// / llama.cpp / ggml can write native logs directly to stdout before JS-level
-// log handlers are attached, so seed the native quiet env before Node imports
-// the CLI and its LLM modules. Preserve explicit user values when provided.
-if (process.argv[2] === "mcp") {
-  process.env.LLAMA_LOG_LEVEL = process.env.LLAMA_LOG_LEVEL || "error";
-  process.env.GGML_LOG_LEVEL = process.env.GGML_LOG_LEVEL || "error";
-  process.env.GGML_BACKEND_SILENT = process.env.GGML_BACKEND_SILENT || "1";
-}
-
-// libggml-metal on macOS uses "residency sets" to keep allocated model memory
-// resident across inference requests (180-second keep_alive timer). The
-// process-static device destructor that runs during libc exit() asserts the
-// residency set is empty (ggml-org/llama.cpp#22593); the keep_alive hasn't
-// expired by exit, so the assertion fails and ggml_abort dumps a multi-kB
-// stack trace to stderr even when the user-visible results were already
-// emitted correctly.
-//
-// For QMD's short-lived CLI workflow, residency sets provide no observable
-// performance benefit, so disable them by default on darwin.
-if (process.platform === "darwin" && process.env.QMD_METAL_KEEP_RESIDENCY !== "1") {
-  process.env.GGML_METAL_NO_RESIDENCY = process.env.GGML_METAL_NO_RESIDENCY || "1";
-}
-
 // In published packages, bin/qmd must run dist/. In a git checkout, however,
 // dist/ is often ignored and can be stale after git reset or branch switches.
 // Prefer source mode only for checkouts so ./bin/qmd reflects the checked-out
@@ -69,8 +45,7 @@ if (!useSourceMode && !existsSync(jsEntry)) {
   process.exit(1);
 }
 
-// Pin Node to the binary that launched this trampoline. Native addons
-// (better-sqlite3) are compiled for that install's ABI.
+// Pin Node to the binary that launched this trampoline for consistent runtime behavior.
 const runner = process.execPath;
 const args = useSourceMode ? runnerArgs : [jsEntry, ...process.argv.slice(2)];
 

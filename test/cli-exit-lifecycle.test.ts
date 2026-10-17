@@ -1,6 +1,5 @@
 import { describe, expect, test } from "vitest";
 import { createCliResourceCloser, finishSuccessfulCliCommand } from "../src/cli/qmd.ts";
-import { LlamaCpp, isDarwinMetalMitigationActive } from "../src/llm.ts";
 
 describe("CLI successful-exit lifecycle", () => {
   test("shares one provider-to-database cleanup across concurrent callers", async () => {
@@ -44,7 +43,7 @@ describe("CLI successful-exit lifecycle", () => {
       command: "query",
       format: "json",
       cleanup: async () => {
-        throw new Error("ggml_metal_device_free abort simulation");
+        throw new Error("remote client cleanup failure");
       },
       exit: (code) => {
         exitCodes.push(code);
@@ -77,11 +76,7 @@ describe("CLI successful-exit lifecycle", () => {
   });
 
   test("production path: sets process.exitCode=0 and returns instead of calling process.exit", async () => {
-    // The real CLI does NOT pass `exit` — finishSuccessfulCliCommand should set
-    // process.exitCode and return, letting Node's `beforeExit` fire so
-    // node-llama-cpp's auto-dispose runs BEFORE libc's static destructor.
-    // process.exit() skips `beforeExit`, which is what trips the libggml-metal
-    // assertion (ggml-org/llama.cpp#22593) even with explicit dispose.
+    // Let pending output and remote-client cleanup settle before natural exit.
     const prevCode = process.exitCode;
     process.exitCode = 1; // poison the state to verify we set it
     try {
@@ -101,60 +96,4 @@ describe("CLI successful-exit lifecycle", () => {
     }
   });
 
-  test("darwin Metal mitigation reflects launcher-exported env on darwin", () => {
-    // The real mitigation lives in bin/qmd, which sets GGML_METAL_NO_RESIDENCY=1
-    // before Node loads the llama.cpp native binding. The JS-side predicate
-    // just reports whether that env was set (and not overridden by
-    // QMD_METAL_KEEP_RESIDENCY). On non-darwin the function returns false.
-    const expected =
-      process.platform === "darwin" &&
-      process.env.QMD_METAL_KEEP_RESIDENCY !== "1" &&
-      process.env.GGML_METAL_NO_RESIDENCY === "1";
-    expect(isDarwinMetalMitigationActive()).toBe(expected);
-  });
-
-  test("QMD_METAL_KEEP_RESIDENCY=1 disables the mitigation even when GGML_METAL_NO_RESIDENCY is set", () => {
-    const prevKeep = process.env.QMD_METAL_KEEP_RESIDENCY;
-    const prevNoRes = process.env.GGML_METAL_NO_RESIDENCY;
-    try {
-      process.env.QMD_METAL_KEEP_RESIDENCY = "1";
-      process.env.GGML_METAL_NO_RESIDENCY = "1";
-      expect(isDarwinMetalMitigationActive()).toBe(false);
-    } finally {
-      if (prevKeep === undefined) delete process.env.QMD_METAL_KEEP_RESIDENCY;
-      else process.env.QMD_METAL_KEEP_RESIDENCY = prevKeep;
-      if (prevNoRes === undefined) delete process.env.GGML_METAL_NO_RESIDENCY;
-      else process.env.GGML_METAL_NO_RESIDENCY = prevNoRes;
-    }
-  });
-
-  test("disposes Llama resources in dependency order before CLI exit", async () => {
-    const calls: string[] = [];
-    const llm = new LlamaCpp({ inactivityTimeoutMs: 0 });
-    const disposable = (name: string) => ({
-      dispose: async () => {
-        calls.push(name);
-      },
-    });
-
-    Object.assign(llm, {
-      embedContexts: [disposable("embed-context")],
-      rerankContexts: [disposable("rerank-context")],
-      embedModel: disposable("embed-model"),
-      generateModel: disposable("generate-model"),
-      rerankModel: disposable("rerank-model"),
-      llama: disposable("llama"),
-    });
-
-    await llm.dispose();
-
-    expect(calls).toEqual([
-      "embed-context",
-      "rerank-context",
-      "embed-model",
-      "generate-model",
-      "rerank-model",
-      "llama",
-    ]);
-  });
 });

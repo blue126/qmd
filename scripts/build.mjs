@@ -24,6 +24,8 @@ function run(command, args, options = {}) {
   }
 }
 
+// Remove obsolete compiled modules when switching from a pre-remote-only build.
+rmSync(join(root, "dist"), { recursive: true, force: true });
 run(process.execPath, [join(root, "node_modules", "typescript", "bin", "tsc"), "-p", "tsconfig.build.json"]);
 copyFileSync(
   join(root, "src", "search", "zh-dict.txt"),

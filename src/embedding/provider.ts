@@ -92,6 +92,8 @@ export interface EmbeddingProvider {
   readonly model: string;
   readonly dimension: number | null;
   readonly remote: boolean;
+  /** False for diagnostic-only providers with missing credentials or retired execution. */
+  readonly available?: boolean;
 
   canonicalIdentityMaterial(): string;
   /** Compute identity material from a persisted dimension without loading the model. */

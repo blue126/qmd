@@ -732,16 +732,9 @@ export type StdioShutdownStdin = {
 export type StdioShutdownOptions = {
   /** Closes the MCP server and its transport. */
   closeServer: () => Promise<void>;
-  /** Closes the SQLite store (owns disposing the per-store llama.cpp instance). */
+  /** Closes the SQLite store (owns disposing the per-store remote clients). */
   closeStore: () => void | Promise<void>;
-  /**
-   * Optional extra llama.cpp teardown, run before closeStore. The MCP store
-   * disposes its own per-store LlamaCpp inside closeStore, so this is left
-   * unset there; it exists for callers that own a separate instance. If
-   * omitted, the step is skipped (do NOT default it to the global
-   * disposeDefaultLlamaCpp — that would tear down an unrelated instance in an
-   * embedded process).
-   */
+  /** Optional extra remote-client teardown, run before closeStore. */
   disposeLlm?: () => Promise<void>;
   /** Waits for in-flight handlers to settle (see InflightGate.waitForIdle). */
   waitForIdle?: (timeoutMs: number) => Promise<boolean>;
@@ -758,32 +751,9 @@ export type StdioShutdownOptions = {
 };
 
 /**
- * Shut the stdio MCP server down when stdin reaches EOF (#751).
- *
- * The SDK's StdioServerTransport subscribes to stdin "data"/"error" only and
- * never notices "end"/"close". When the parent MCP client dies, nothing tears
- * the process down: the warm llama.cpp model's native handles keep the event
- * loop alive, so the server reparents to PID 1, leaks RAM, and keeps the
- * SQLite index open. stdin EOF means the client is gone, so this treats it as
- * a disconnect: no new requests are accepted and nobody is left to read a
- * response — but handlers that are already running get a bounded window to
- * settle (waitForIdle) before their llm/store dependencies are torn down.
- *
- * Teardown order matters. Close the transport first so no further requests
- * are dispatched, wait for in-flight handlers, then close the store last —
- * which disposes the store's own llama.cpp instance and then the database, so
- * the dispose path cannot hit an already-closed DB. (disposeLlm is an optional
- * extra step for callers that own a separate instance; the MCP store does
- * not.) Failures are logged best-effort (the parent's death may have closed
- * stderr too) and do not stop the remaining steps. The function sets process.exitCode
- * instead of calling process.exit() so `beforeExit` still fires and
- * node-llama-cpp's auto-dispose runs before libc's static destructors —
- * process.exit() during native-addon unload has caused exit-time crashes
- * before (#59, #129; same rationale as finishSuccessfulCliCommand in the CLI).
- *
- * Returns the idempotent shutdown function: every invocation (manual, "end",
- * "close", or already-ended stdin) shares one promise, and the promise never
- * rejects.
+ * On stdin EOF, stop accepting requests, allow bounded in-flight work to settle,
+ * then release this server's clients and SQLite store. Cleanup is idempotent,
+ * best-effort, and sets exitCode so pending output can drain naturally.
  */
 export function registerStdioEofShutdown(options: StdioShutdownOptions): () => Promise<void> {
   const stdin = options.stdin ?? process.stdin;
@@ -838,7 +808,7 @@ export function registerStdioEofShutdown(options: StdioShutdownOptions): () => P
       });
     }
     if (options.disposeLlm) {
-      await step("llama disposal", options.disposeLlm);
+      await step("LLM disposal", options.disposeLlm);
     }
     await step("store.close()", options.closeStore);
 
@@ -889,11 +859,7 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
   // stay 2025-only even on SDK 2.x.
   const handle = serveStdio(() => createMcpServer(store, inflight));
 
-  // Follow the parent's lifecycle: when stdin reaches EOF the client is gone
-  // and the server must exit instead of orphaning to PID 1 (#751). No
-  // disposeLlm here — store.close() disposes this store's own LlamaCpp
-  // instance, so passing the global disposeDefaultLlamaCpp would only risk
-  // tearing down an unrelated instance in an embedded process.
+  // EOF ends the client connection; release only this server's resources.
   registerStdioEofShutdown({
     closeServer: () => handle.close(),
     waitForIdle: (timeoutMs) => inflight.waitForIdle(timeoutMs),

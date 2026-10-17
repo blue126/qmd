@@ -2,13 +2,12 @@
  * MCP Server Tests
  *
  * Tests all MCP tools, resources, and prompts.
- * Uses mocked Ollama responses and a test database.
+ * Uses remote mocks and a test database.
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { openDatabase, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm.js";
 import { readFileSync, unlinkSync } from "node:fs";
 import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
 import { join } from "node:path";
@@ -26,14 +25,6 @@ import { initializeMetadataSchema } from "../src/metadata-store.js";
 let testDb: Database;
 let testDbPath: string;
 let testConfigDir: string;
-const modelIntegrationDimension = Number(process.env.QMD_MODEL_INTEGRATION_DIMENSION ?? 0);
-const runModelIntegration = Number.isInteger(modelIntegrationDimension) && modelIntegrationDimension > 0;
-
-afterAll(async () => {
-  // Ensure native resources are released to avoid ggml-metal asserts on process exit.
-  await disposeDefaultLlamaCpp();
-});
-
 function initTestDatabase(db: Database): void {
   loadSqliteVec(db);
   db.exec("PRAGMA journal_mode = WAL");
@@ -106,9 +97,6 @@ function initTestDatabase(db: Database): void {
     END
   `);
 
-  if (runModelIntegration) {
-    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, collection TEXT, embedding float[${modelIntegrationDimension}] distance_metric=cosine)`);
-  }
 
   // Store collections — makes the DB self-contained
   db.exec(`
@@ -188,14 +176,7 @@ function seedTestData(db: Database): void {
     `).run(doc.path, doc.title, doc.hash, now, now);
   }
 
-  if (runModelIntegration) {
-    const embedding = new Float32Array(modelIntegrationDimension);
-    for (let i = 0; i < modelIntegrationDimension; i++) embedding[i] = Math.random();
-    for (const doc of docs.slice(0, 4)) { // Skip large file for embeddings
-      db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, ?, ?, ?)`).run(doc.hash, DEFAULT_EMBED_MODEL, getEmbeddingFingerprint(DEFAULT_EMBED_MODEL), now);
-      db.prepare(`INSERT INTO vectors_vec (hash_seq, collection, embedding) VALUES (?, ?, ?)`).run(`${doc.hash}_0`, "docs", embedding);
-    }
-  }
+
 }
 
 // =============================================================================
@@ -233,10 +214,6 @@ import type { RankedResult } from "../src/store.js";
 
 describe("MCP Server", () => {
   beforeAll(async () => {
-    // LlamaCpp uses node-llama-cpp for local model inference (no HTTP mocking needed)
-    // Use shared singleton to avoid creating multiple instances with separate GPU resources
-    getDefaultLlamaCpp();
-
     // Reset index name in case another test file mutated it (bun test shares process)
     setConfigIndexName("index");
 
@@ -331,120 +308,17 @@ describe("MCP Server", () => {
   // searchVec (Vector similarity search)
   // ===========================================================================
 
-  describe.skipIf(!runModelIntegration)("searchVec (vector similarity)", () => {
-    test("returns results for semantic query", async () => {
-      const results = await searchVec(testDb, "project documentation", DEFAULT_EMBED_MODEL, 10);
-      expect(results.length).toBeGreaterThan(0);
+  test("performs RRF fusion without model services", () => {
+    const item = (file: string, score: number): RankedResult => ({
+      file, displayPath: file, title: file, body: "body", score,
     });
-
-    test("respects limit parameter", async () => {
-      const results = await searchVec(testDb, "documentation", DEFAULT_EMBED_MODEL, 2);
-      expect(results.length).toBeLessThanOrEqual(2);
-    });
-
-    test("returns empty when no vector table exists", async () => {
-      const emptyDb = openDatabase(":memory:");
-      initTestDatabase(emptyDb);
-      emptyDb.exec("DROP TABLE IF EXISTS vectors_vec");
-
-      const results = await searchVec(emptyDb, "test", DEFAULT_EMBED_MODEL, 10);
-      expect(results.length).toBe(0);
-      emptyDb.close();
-    });
+    const fused = reciprocalRankFusion([
+      [item("/a", 1), item("/b", 0.8)],
+      [item("/b", 1), item("/c", 0.9)],
+    ]);
+    expect(fused).toHaveLength(3);
+    expect(fused.some(result => result.file === "/b")).toBe(true);
   });
-
-  // ===========================================================================
-  // hybridQuery (query expansion + reranking)
-  // ===========================================================================
-
-  describe.skipIf(!runModelIntegration)("hybridQuery (expansion + reranking)", () => {
-    test("expands query with typed variations", async () => {
-      const expanded = await expandQuery("api documentation", DEFAULT_QUERY_MODEL, testDb);
-      // Returns ExpandedQuery[] — typed expansions, original excluded
-      expect(expanded.length).toBeGreaterThanOrEqual(1);
-      for (const q of expanded) {
-        expect(['lex', 'vec', 'hyde']).toContain(q.type);
-        expect(q.query.length).toBeGreaterThan(0);
-      }
-    }, 90000);
-
-    test("performs RRF fusion on multiple result lists", () => {
-      const list1: RankedResult[] = [
-        { file: "/a", displayPath: "a.md", title: "A", body: "body", score: 1 },
-        { file: "/b", displayPath: "b.md", title: "B", body: "body", score: 0.8 },
-      ];
-      const list2: RankedResult[] = [
-        { file: "/b", displayPath: "b.md", title: "B", body: "body", score: 1 },
-        { file: "/c", displayPath: "c.md", title: "C", body: "body", score: 0.9 },
-      ];
-
-      const fused = reciprocalRankFusion([list1, list2]);
-      expect(fused.length).toBe(3);
-      // B appears in both lists, should have higher score
-      const bResult = fused.find(r => r.file === "/b");
-      expect(bResult).toBeDefined();
-    });
-
-    test("reranks documents with LLM", async () => {
-      const docs = [
-        { file: "/test/docs/readme.md", text: "Project readme" },
-        { file: "/test/docs/api.md", text: "API documentation" },
-      ];
-      const reranked = await rerank("readme", docs, DEFAULT_RERANK_MODEL, testDb);
-      expect(reranked.length).toBe(2);
-      expect(reranked[0]!.score).toBeGreaterThan(0);
-    });
-
-    test("full hybrid search pipeline", async () => {
-      // Simulate full qmd_deep_search flow with type-routed queries
-      const query = "meeting notes";
-      const expanded = await expandQuery(query, DEFAULT_QUERY_MODEL, testDb);
-
-      const rankedLists: RankedResult[][] = [];
-
-      // Original query → FTS (probe)
-      const probeFts = searchFTS(testDb, query, 20);
-      if (probeFts.length > 0) {
-        rankedLists.push(probeFts.map(r => ({
-          file: r.filepath, displayPath: r.displayPath,
-          title: r.title, body: r.body || "", score: r.score,
-        })));
-      }
-
-      // Expanded queries → route by type: lex→FTS, vec/hyde skipped (no vectors in test)
-      for (const q of expanded) {
-        if (q.type === 'lex') {
-          const ftsResults = searchFTS(testDb, q.query, 20);
-          if (ftsResults.length > 0) {
-            rankedLists.push(ftsResults.map(r => ({
-              file: r.filepath, displayPath: r.displayPath,
-              title: r.title, body: r.body || "", score: r.score,
-            })));
-          }
-        }
-        // vec/hyde would go to searchVec — not available in this unit test
-      }
-
-      expect(rankedLists.length).toBeGreaterThan(0);
-
-      const fused = reciprocalRankFusion(rankedLists);
-      expect(fused.length).toBeGreaterThan(0);
-
-      const candidates = fused.slice(0, 10);
-      const reranked = await rerank(
-        query,
-        candidates.map(c => ({ file: c.file, text: c.body })),
-        DEFAULT_RERANK_MODEL,
-        testDb
-      );
-
-      expect(reranked.length).toBeGreaterThan(0);
-    }, 90000);
-  });
-
-  // ===========================================================================
-  // Tool: qmd_get (Get Document)
-  // ===========================================================================
 
   describe("qmd_get tool", () => {
     test("retrieves document by display_path", () => {
@@ -605,7 +479,7 @@ describe("MCP Server", () => {
     test("returns index status", () => {
       const status = getStatus(testDb);
       expect(status.totalDocuments).toBe(5);
-      expect(status.hasVectorIndex).toBe(runModelIntegration);
+      expect(status.hasVectorIndex).toBe(false);
       expect(status.collections.length).toBe(1);
       expect(status.collections[0]!.path).toBe("/test/docs");
     });
@@ -614,7 +488,7 @@ describe("MCP Server", () => {
       const status = getStatus(testDb);
       // The model-integration fixture embeds four documents; the deterministic
       // contract fixture intentionally embeds none.
-      expect(status.needsEmbedding).toBe(runModelIntegration ? 1 : 5);
+      expect(status.needsEmbedding).toBe(5);
     });
   });
 
@@ -943,7 +817,7 @@ describe("MCP Server", () => {
 import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/server.js";
 import { _resetProductionModeForTesting } from "../src/store.js";
 
-describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
+describe("MCP HTTP Transport", () => {
   let handle: HttpServerHandle;
   let baseUrl: string;
   let httpTestDbPath: string;
@@ -1180,7 +1054,7 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
 
     const queryTool = json.result.tools.find((tool: any) => tool.name === "query");
     expect(queryTool.inputSchema.properties.expansion.enum).toEqual(["auto", "force", "skip"]);
-    expect(queryTool.inputSchema.properties.intent).toBeUndefined();
+    expect(queryTool.inputSchema.properties.intent.type).toBe("string");
     expect(queryTool.inputSchema.properties.expansionContext.type).toBe("string");
     expect(queryTool.inputSchema.properties.rerankContext.type).toBe("string");
     expect(queryTool.inputSchema.properties.explain.type).toBe("boolean");
@@ -1189,7 +1063,7 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
   test("POST /mcp tools/call query returns results", async () => {
     const { status, json } = await mcpRequest(
       "tools/call",
-      { name: "query", arguments: { searches: [{ type: "lex", query: "readme" }] } },
+      { name: "query", arguments: { searches: [{ type: "lex", query: "readme" }], rerank: false } },
       { "Mcp-Name": "query" },
       3,
     );

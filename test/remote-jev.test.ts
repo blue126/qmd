@@ -236,6 +236,42 @@ describe("RemoteJev & Hybrid Integration", () => {
       expect(processed).toBe(1);
     });
 
+    test("failed rerank batches retain ownership until all started requests settle", async () => {
+      let failFirst!: (error: Error) => void;
+      let finishSecond!: () => void;
+      let secondSignal!: AbortSignal;
+      const first = new Promise<never>((_resolve, reject) => { failFirst = reject; });
+      let calls = 0;
+      const client: JevSystemOneClient = {
+        systemOne: vi.fn((_request, options) => {
+          if (++calls === 1) return first;
+          secondSignal = options.signal;
+          return new Promise(resolve => {
+            finishSecond = () => resolve({ answers: { cand_0: { noul: 0.5 } } });
+          });
+        }),
+      };
+      const jev = new RemoteJev({ client, concurrency: 2, batchSize: 1 });
+      let rerankSettled = false;
+      const rerank = jev.rerank("query", ["first", "second", "must remain queued"])
+        .catch(error => { rerankSettled = true; return error; });
+      const failure = new Error("first batch failed");
+      failFirst(failure);
+      // Flush the failed batch chain while the other request remains controlled.
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(rerankSettled).toBe(false);
+      let disposed = false;
+      const dispose = jev.dispose().then(() => { disposed = true; });
+      await Promise.resolve();
+      expect(secondSignal.aborted).toBe(true);
+      expect(disposed).toBe(false);
+      finishSecond();
+      expect(await rerank).toBe(failure);
+      await dispose;
+      expect(disposed).toBe(true);
+      expect(client.systemOne).toHaveBeenCalledTimes(2);
+    });
+
     test("safely truncates candidate text without breaking surrogate pairs", async () => {
       let capturedText = "";
       const mockClient: JevSystemOneClient = {
@@ -256,61 +292,16 @@ describe("RemoteJev & Hybrid Integration", () => {
     });
   });
 
-  describe("Hybrid (3-way fallback: Jev -> RemoteLLM -> LocalLLM)", () => {
-    test("rerank prioritizes Jev, falls back to RemoteLLM, then LocalLLM", async () => {
-      let localRerankCalled = false;
-      const mockLocalLLM: LLM = {
-        embed: async () => null,
-        generate: async () => null,
-        modelExists: async (m) => ({ name: m, exists: true }),
-        expandQuery: async (q) => [{ type: "vec", text: `local:${q}` }],
-        rerank: async (_q, docs) => {
-          localRerankCalled = true;
-          return {
-            results: docs.map((d, i) => ({ file: typeof d === "string" ? d : d.file, score: 0.3, index: i })),
-            model: "local-rerank",
-          };
-        },
-        dispose: async () => {},
-      };
-
-      let jevShouldFail = false;
-      const mockJevClient: JevSystemOneClient = {
-        systemOne: vi.fn(async () => {
-          if (jevShouldFail) throw new Error("Jev service unavailable");
-          return {
-            answers: {
-              cand_0: { type: "noul", noul: 0.88 },
-            },
-          };
-        }),
-      };
-      const jev = new RemoteJev({ client: mockJevClient });
-
-      const hybrid = new Hybrid(mockLocalLLM, undefined, jev);
-
-      // 1. Jev succeeds
-      const res1 = await hybrid.rerank("query", [{ file: "f.md", text: "t" }]);
-      expect(res1.model).toBe("jev:jev-1.13");
-      expect(res1.results[0]?.score).toBe(0.88);
-      expect(localRerankCalled).toBe(false);
-
-      // 2. Jev fails -> fallback to LocalLLM
-      jevShouldFail = true;
-      jev.resetCircuitBreaker();
-      const res2 = await hybrid.rerank("query", [{ file: "f.md", text: "t" }]);
-      expect(res2.model).toBe("local-rerank");
-      expect(localRerankCalled).toBe(true);
-    });
-
+  describe("Hybrid remote composition", () => {
     test("expandQuery uses Jev intent classification to guide LLM expansion", async () => {
-      let passedOptionsToLocal: any = null;
-      const mockLocalLLM: LLM = {
+      let passedOptionsToRemote: any = null;
+      const mockRemoteLLM: LLM = {
+        supportsExpand: true,
         embed: async () => null,
         generate: async () => null,
         modelExists: async (m) => ({ name: m, exists: true }),
         expandQuery: async (q, opts) => {
-          passedOptionsToLocal = opts;
+          passedOptionsToRemote = opts;
           return [{ type: "vec", text: `expanded:${q}` }];
         },
         rerank: async () => ({ results: [], model: "local" }),
@@ -337,7 +328,7 @@ describe("RemoteJev & Hybrid Integration", () => {
       };
       const jev = new RemoteJev({ client: mockJevClient });
 
-      const hybrid = new Hybrid(mockLocalLLM, undefined, jev);
+      const hybrid = new Hybrid(mockRemoteLLM as any, jev);
 
       const expanded = await hybrid.expandQuery("fetch user token", { context: "auth module" });
       expect(expanded).toEqual([{ type: "vec", text: "expanded:fetch user token" }]);
@@ -345,22 +336,23 @@ describe("RemoteJev & Hybrid Integration", () => {
       // Verify that options passed to LLM include Jev guidance:
       // includeHyde set to true (since needs_hyde.noul > 0.6)
       // and searchIntent contains strategy playbook details without polluting context
-      expect(passedOptionsToLocal.includeHyde).toBe(true);
-      expect(passedOptionsToLocal.context).toBe("auth module");
-      expect(passedOptionsToLocal.searchIntent).toBeDefined();
-      expect(passedOptionsToLocal.searchIntent.label).toBe("Code Search");
-      expect(passedOptionsToLocal.searchIntent.lexGuidance).toContain("Prioritize exact function");
-      expect(passedOptionsToLocal.searchIntent.vecGuidance).toContain("concrete implementation");
+      expect(passedOptionsToRemote.includeHyde).toBe(true);
+      expect(passedOptionsToRemote.context).toBe("auth module");
+      expect(passedOptionsToRemote.searchIntent).toBeDefined();
+      expect(passedOptionsToRemote.searchIntent.label).toBe("Code Search");
+      expect(passedOptionsToRemote.searchIntent.lexGuidance).toContain("Prioritize exact function");
+      expect(passedOptionsToRemote.searchIntent.vecGuidance).toContain("concrete implementation");
     });
 
     test("expandQuery skips Jev guidance when confidence is below 0.5", async () => {
-      let passedOptionsToLocal: any = null;
-      const mockLocalLLM: LLM = {
+      let passedOptionsToRemote: any = null;
+      const mockRemoteLLM: LLM = {
+        supportsExpand: true,
         embed: async () => null,
         generate: async () => null,
         modelExists: async (m) => ({ name: m, exists: true }),
         expandQuery: async (q, opts) => {
-          passedOptionsToLocal = opts;
+          passedOptionsToRemote = opts;
           return [{ type: "vec", text: `expanded:${q}` }];
         },
         rerank: async () => ({ results: [], model: "local" }),
@@ -387,23 +379,24 @@ describe("RemoteJev & Hybrid Integration", () => {
       };
       const jev = new RemoteJev({ client: mockJevClient });
 
-      const hybrid = new Hybrid(mockLocalLLM, undefined, jev);
+      const hybrid = new Hybrid(mockRemoteLLM as any, jev);
 
       const initialOpts = { context: "original context" };
       await hybrid.expandQuery("ambiguous query", initialOpts);
 
       // Low confidence skips guidance, original options passed unmodified
-      expect(passedOptionsToLocal).toEqual(initialOpts);
+      expect(passedOptionsToRemote).toEqual(initialOpts);
     });
 
     test("expandQuery gracefully falls back when Jev throws", async () => {
-      let passedOptionsToLocal: any = null;
-      const mockLocalLLM: LLM = {
+      let passedOptionsToRemote: any = null;
+      const mockRemoteLLM: LLM = {
+        supportsExpand: true,
         embed: async () => null,
         generate: async () => null,
         modelExists: async (m) => ({ name: m, exists: true }),
         expandQuery: async (q, opts) => {
-          passedOptionsToLocal = opts;
+          passedOptionsToRemote = opts;
           return [{ type: "vec", text: `expanded:${q}` }];
         },
         rerank: async () => ({ results: [], model: "local" }),
@@ -417,60 +410,32 @@ describe("RemoteJev & Hybrid Integration", () => {
       };
       const jev = new RemoteJev({ client: mockJevClient });
 
-      const hybrid = new Hybrid(mockLocalLLM, undefined, jev);
+      const hybrid = new Hybrid(mockRemoteLLM as any, jev);
 
       const initialOpts = { context: "original context" };
       const res = await hybrid.expandQuery("query", initialOpts);
       expect(res).toEqual([{ type: "vec", text: "expanded:query" }]);
-      expect(passedOptionsToLocal).toEqual(initialOpts);
+      expect(passedOptionsToRemote).toEqual(initialOpts);
     });
 
-    test("modelExists checks provider presence before returning true for jev models", async () => {
-      const mockLocalLLM: LLM = {
-        embed: async () => null,
-        generate: async () => null,
-        modelExists: async () => ({ name: "local", exists: false }),
-        expandQuery: async () => [],
-        rerank: async () => ({ results: [], model: "local" }),
-        dispose: async () => {},
-      };
 
-      // When remoteJev is NOT configured
-      const hybridWithoutJev = new Hybrid(mockLocalLLM);
-      const resWithoutJev = await hybridWithoutJev.modelExists("jev:jev-1.13");
-      expect(resWithoutJev.exists).toBe(false);
-
-      // When remoteJev IS configured
-      const mockJevClient: JevSystemOneClient = { systemOne: vi.fn() };
-      const jev = new RemoteJev({ client: mockJevClient });
-      const hybridWithJev = new Hybrid(mockLocalLLM, undefined, jev);
-      const resWithJev = await hybridWithJev.modelExists("jev:jev-1.13");
-      expect(resWithJev.exists).toBe(true);
+    test("Jev reranking failure uses the other configured remote service", async () => {
+      const jev = { supportsRerank: true, rerank: vi.fn(async () => { throw new Error("unavailable"); }) } as any;
+      const remote = { supportsRerank: true, rerank: vi.fn(async () => ({results: [], model:"remote"})) } as any;
+      await expect(new Hybrid(remote, jev).rerank("query", [])).resolves.toMatchObject({model:"remote"});
+      expect(remote.rerank).toHaveBeenCalledOnce();
     });
-
-    test("rerankModelName provides isolated cache namespace for Jev, RemoteLLM, and LocalLLM", () => {
-      const mockLocalLLM: any = {
-        rerankModelName: "local-qwen",
-      };
-      const mockJevClient: JevSystemOneClient = { systemOne: vi.fn() };
-      const jev = new RemoteJev({ client: mockJevClient, model: "jev-1.13" });
-      expect(jev.rerankModelName).toBe("jev:jev-1.13");
-
-      // Hybrid with Jev prioritizes Jev's model name
-      const hybridWithJev = new Hybrid(mockLocalLLM, undefined, jev);
-      expect(hybridWithJev.rerankModelName).toBe("jev:jev-1.13");
-
-      // Hybrid with RemoteLLM (no Jev)
-      const mockRemoteLLM: any = {
-        supportsRerank: true,
-        rerankModelName: "remote-bge-reranker",
-      };
-      const hybridWithRemote = new Hybrid(mockLocalLLM, mockRemoteLLM);
-      expect(hybridWithRemote.rerankModelName).toBe("remote-bge-reranker");
-
-      // Hybrid with LocalLLM only
-      const hybridLocalOnly = new Hybrid(mockLocalLLM);
-      expect(hybridLocalOnly.rerankModelName).toBe("local-qwen");
+    test("Jev classification failure still allows direct remote expansion", async () => {
+      const jev = { supportsExpand: true, classifyIntent: vi.fn(async () => { throw new Error("unavailable"); }) } as any;
+      const remote = { supportsExpand: true, expandQuery: vi.fn(async () => [{type:"vec",text:"remote"}]) } as any;
+      await expect(new Hybrid(remote, jev).expandQuery("query")).resolves.toEqual([{type:"vec",text:"remote"}]);
+    });
+    test("cancellation never falls through to another provider", async () => {
+      const controller = new AbortController(); controller.abort();
+      const jev = { supportsRerank:true, rerank: vi.fn(async () => { throw new Error("aborted"); }) } as any;
+      const remote = { supportsRerank:true, rerank: vi.fn() } as any;
+      await expect(new Hybrid(remote, jev).rerank("query", [], {signal:controller.signal})).rejects.toThrow("aborted");
+      expect(remote.rerank).not.toHaveBeenCalled();
     });
   });
 });

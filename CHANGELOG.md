@@ -4,7 +4,10 @@
 
 ### Changed
 
-- Dependency upgrades and runtime engine modernization: Updated Node.js engine target to `>=24.21.0` (LTS Krypton) and packageManager to `pnpm@12.6.0`. Upgraded dependencies and toolchain including `node-llama-cpp` to `3.22.1`, `zod` to `4.6.5`, `@modelcontextprotocol/server` to `2.1.0`, `picomatch` to `4.0.7`, `yaml` to `2.9.1`, `tsx` to `4.23.15`, `oxlint` to `1.85.0`, `vitest` to `4.1.11` (patching security advisory GHSA-82fw-gwwq-j7x9), and refreshed patch/minor dependency overrides.
+- **Remote-only runtime (unpublished review build `2026.10.18-remote.0`)**: Remove local GGUF inference and the `node-llama-cpp` dependency. CLI, MCP, and SDK keep local SQLite/BM25, CJK, AST, collections, reads, and maintenance; embedding, query expansion, and reranking use explicitly configured remote APIs. `qmd pull` now reports retirement and exits unsuccessfully without downloading anything. Existing local-model databases remain available for lexical reads; remote vector use requires an explicit manual rebuild rather than automatic vector conversion or deletion. Package and model regression checks use mocks or loopback HTTP only.
+- **Breaking SDK change:** Retire `LlamaCpp`, local provider owners, default-Llama singleton/session helpers, model pull/GGUF/GPU/tokenizer APIs, and `internal.localLlm`. Use `createStore()` with explicit remote models, or `searchLex()` / explicit model-free query options. Missing expansion or reranking configuration fails clearly rather than silently downgrading retrieval.
+
+- Dependency upgrades and runtime engine modernization: Updated Node.js engine target to `>=24.21.0` (LTS Krypton) and packageManager to `pnpm@12.6.0`. Upgraded dependencies and toolchain including `zod` to `4.6.5`, `@modelcontextprotocol/server` to `2.1.0`, `picomatch` to `4.0.7`, `yaml` to `2.9.1`, `tsx` to `4.23.15`, `oxlint` to `1.85.0`, `vitest` to `4.1.11` (patching security advisory GHSA-82fw-gwwq-j7x9), and refreshed patch/minor dependency overrides.
 
 ### Fixed
 
@@ -21,7 +24,7 @@
 
 - In-flight Singleflight Deduplication & In-Memory LRU Cache: Added granular in-memory `Map<string, Promise<T>>` query-level singleflight deduplication (`inflightExpansions` and `inflightEmbeddings`) and `LRUCache` fallbacks (`memoryLlmCache` and `memoryEmbeddingCache`, powered by `lru-cache`) in `expandQuery` and `embedQueriesForStore`. Features configurable TTL (`2 hours`), item bounds (1,000 for LLM responses, 2,000 for embeddings), and memory size bounds (50 MB for LLM text, 64 MB for float64 embedding vectors) with automatic byte size calculation. In `readOnly: true` environments (such as MCP stdio/HTTP servers) where SQLite write is disabled, query expansions and embeddings gracefully cache in memory. Concurrent requests seamlessly share in-flight promises across identical or partially overlapping query batches, and subsequent queries hit the memory cache, eliminating redundant remote LLM/Jev/embedding API calls and network latency.
 - TypeSafe Jev provider (`src/remote-jev.ts`) supporting System One-based candidate reranking via Noul judgments and query expansion intent classification via Choice and Noul gating. Passes query expansion context to Jev state for contextual intent classification.
-- Refactored `HybridLLM` into `Hybrid` (`src/hybrid.ts`) supporting 3-way provider fallback: `RemoteJev` → `RemoteLLM` → `LlamaCpp`.
+- Refactored `HybridLLM` into `Hybrid` (`src/hybrid.ts`) supporting remote provider composition (`RemoteJev` and `RemoteLLM`).
 - Added `models.jev_api_key`, `models.jev_api_model`, and `models.jev_base_url` configuration options with `TYPESAFE_API_KEY`, `TYPESAFE_DEFAULT_MODEL`, and `TYPESAFE_BASE_URL` environment variable fallbacks.
 - Added TypeSafe Jev provider diagnostic check to `qmd doctor`.
 - Detailed metadata extraction error reporting: `qmd status` and `qmd doctor` now list pending/errored document paths with error hints, and `qmd update` outputs specific files and causes when frontmatter extraction errors occur.

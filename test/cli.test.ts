@@ -262,7 +262,7 @@ describe("CLI Help", () => {
     expect(stdout).toContain("Usage:");
     expect(stdout).toContain("qmd collection add");
     expect(stdout).toContain("qmd search");
-    expect(stdout).toContain("--no-gpu");
+    expect(stdout).not.toContain("--no-gpu");
     expect(stdout).toContain("qmd skill show/install");
   });
 
@@ -480,7 +480,7 @@ describe("CLI Init Command", () => {
     expect(existsSync(join(projectDir, ".qmd", "index.sqlite"))).toBe(true);
     const configText = readFileSync(join(projectDir, ".qmd", "index.yml"), "utf-8");
     expect(configText).toContain("collections: {}");
-    expect(configText).toContain("models:");
+    expect(configText).not.toContain("models:");
   });
 
   test("refuses to initialize in HOME", async () => {
@@ -746,20 +746,20 @@ describe("CLI Status Command", () => {
     expect(stdout).toContain("overrides the SQLite index path");
     expect(stdout).toContain("QMD_CONFIG_DIR");
     expect(stdout).toContain("overrides the QMD config directory");
-    expect(stdout).toContain("model defaults");
-    expect(stdout).toContain("model cache");
-    expect(stdout).toContain("device mode");
-    expect(stdout).toContain("device probe");
+    expect(stdout).toContain("model configuration");
+    expect(stdout).toContain("remote-only runtime");
+    expect(stdout).not.toContain("model cache");
+    expect(stdout).not.toContain("device probe");
     expect(stdout).toContain("embedding freshness");
     expect(stdout).toContain("embedding fingerprints");
     expect(stdout).toContain("embedding vector sample");
-    expect(stdout).toContain("skipped until the local embedding dimension is known");
+    expect(stdout).toContain("doctor never sends embedding requests");
 
     const configText = readFileSync(join(testConfigDir, "index.yml"), "utf-8");
-    expect(configText).toContain("models:");
-    expect(configText).toContain(DEFAULT_EMBED_MODEL_URI);
-    expect(configText).toContain(DEFAULT_GENERATE_MODEL_URI);
-    expect(configText).toContain(DEFAULT_RERANK_MODEL_URI);
+    expect(configText).not.toContain("models:");
+    expect(configText).not.toContain(DEFAULT_EMBED_MODEL_URI);
+    expect(configText).not.toContain(DEFAULT_GENERATE_MODEL_URI);
+    expect(configText).not.toContain(DEFAULT_RERANK_MODEL_URI);
   }, 20000);
 
   test("qmd doctor warns when no collections are configured", async () => {
@@ -848,11 +848,10 @@ describe("CLI Status Command", () => {
 
     const { stdout, exitCode } = await runQmd(["doctor"], { dbPath: env.dbPath, configDir: env.configDir });
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("model defaults");
-    expect(stdout).toContain("non-default model configuration");
-    expect(stdout).toContain("index hf:example/custom-embed/custom.gguf");
-    expect(stdout).toContain("might be ok");
-    expect(stdout).toContain("qmd pull");
+    expect(stdout).toContain("model configuration");
+    expect(stdout).toContain("legacy diagnostic fields");
+    expect(stdout).toContain("local inference is retired");
+    expect(stdout).not.toContain("qmd pull");
   }, 20000);
 
   test("qmd doctor identifies cached non-GGUF model files", async () => {
@@ -874,10 +873,10 @@ describe("CLI Status Command", () => {
       },
     });
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("model cache");
-    expect(stdout).toContain("invalid 1");
-    expect(stdout).toContain("HTML page, not a GGUF model");
-    expect(stdout).toContain("qmd pull --refresh");
+    expect(stdout).toContain("remote-only runtime");
+    expect(stdout).not.toContain("model cache");
+    expect(stdout).not.toContain("qmd pull");
+    expect(readFileSync(badModelPath, "utf8")).toBe("<!doctype html><html>blocked</html>");
   }, 20000);
 
   test("qmd status displays configured API models for embedding, reranking, and generation", async () => {
@@ -922,8 +921,8 @@ describe("CLI Status Command", () => {
       },
     });
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("model cache");
-    expect(stdout).toContain("downloaded and valid GGUF");
+    expect(stdout).toContain("remote-only runtime");
+    expect(stdout).not.toContain("model cache");
     // The sidecar must not be reported as a bad model.
     expect(stdout).not.toContain("not valid GGUF");
     expect(stdout).not.toContain(".etag");
@@ -940,9 +939,8 @@ describe("CLI Status Command", () => {
       env: { QMD_EMBED_MODEL: customEmbed },
     });
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("model defaults");
-    expect(stdout).toContain(`env QMD_EMBED_MODEL=${customEmbed}`);
-    expect(stdout).toContain("might be ok");
+    expect(stdout).toContain("remote-only runtime");
+    expect(stdout).not.toContain("might be ok");
     expect(stdout).toContain("environment overrides");
     expect(stdout).toContain(`QMD_EMBED_MODEL=${customEmbed}`);
     expect(stdout).toContain("sets the active embed model");
@@ -959,28 +957,18 @@ describe("CLI Status Command", () => {
       },
     });
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("QMD_FORCE_CPU=1");
-    expect(stdout).toContain("forces llama.cpp to bypass GPU backends");
-    expect(stdout).toContain("device mode: CPU forced (QMD_FORCE_CPU)");
+    expect(stdout).toContain("remote-only runtime");
+    expect(stdout).not.toContain("QMD_FORCE_CPU");
+    expect(stdout).not.toContain("device mode");
   }, 20000);
 
   test("qmd doctor lists known environment overrides and consequences", async () => {
     const env = await createIsolatedTestEnv("doctor-env-overrides");
     const overrides = {
       XDG_CACHE_HOME: join(env.configDir, "cache"),
-      QMD_DOCTOR_DEVICE_PROBE: "0",
-      QMD_FORCE_CPU: "1",
-      QMD_LLAMA_GPU: "metal",
-      QMD_EMBED_PARALLELISM: "2",
-      QMD_EXPAND_CONTEXT_SIZE: "4096",
-      QMD_RERANK_CONTEXT_SIZE: "8192",
-      QMD_EMBED_CONTEXT_SIZE: "1024",
       QMD_EDITOR_URI: "vscode://file/{file}:{line}:{col}",
       QMD_SKILLS_DIR: "/tmp/qmd-skills",
-      QMD_METAL_KEEP_RESIDENCY: "1",
       NO_COLOR: "1",
-      CI: "1",
-      HF_ENDPOINT: "https://hf-mirror.com",
       WSL_DISTRO_NAME: "Ubuntu",
       WSL_INTEROP: "1",
     };
@@ -994,10 +982,7 @@ describe("CLI Status Command", () => {
     for (const name of Object.keys(overrides)) {
       expect(stdout).toContain(name);
     }
-    expect(stdout).toContain("forces llama.cpp to bypass GPU backends");
     expect(stdout).toContain("moves the default index cache");
-    expect(stdout).toContain("disables real LLM operations");
-    expect(stdout).toContain("changes Hugging Face download endpoint");
   }, 20000);
 
   test("qmd doctor flags mixed embedding fingerprints", async () => {
@@ -3314,15 +3299,13 @@ describe.skipIf(!!process.env.CI)("mcp http daemon", () => {
 // =============================================================================
 
 describe("mcp stdio launcher", () => {
-  test("sets native llama/ggml quiet env before Node starts so stdout stays JSON-RPC only", async () => {
+  test("keeps stdout JSON-RPC and leaves retired native settings untouched", async () => {
     const tempPackage = await mkdtemp(join(tmpdir(), "qmd-bin-mcp-"));
     try {
       await mkdir(join(tempPackage, "bin"), { recursive: true });
       await mkdir(join(tempPackage, "dist", "cli"), { recursive: true });
       await writeFile(join(tempPackage, "dist", "cli", "qmd.js"), [
-        'if (process.env.GGML_BACKEND_SILENT !== "1") {',
-        '  process.stdout.write("llama.cpp native log on stdout\\n");',
-        '}',
+        'if (process.env.GGML_BACKEND_SILENT !== "explicit-user-value") process.exit(9);',
         'process.stdout.write(\'{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\\n\');',
         '',
       ].join("\n"));
@@ -3334,7 +3317,7 @@ describe("mcp stdio launcher", () => {
 
       // Force the wrapper down the Node branch. The trampoline now execs
       // process.execPath (not PATH `node`) so the dist fixture is the child
-      // that observes the quiet env. Fake PATH `node` remains only to satisfy
+      // that emits JSON-RPC frames. Fake PATH `node` remains only to satisfy
       // `#!/usr/bin/env node` and the bun-test fallback (`bun bin/qmd`).
       await writeFile(join(tempPackage, "package-lock.json"), "{}\n");
       const fakeNode = join(tempPackage, "fake-bin", "node");
@@ -3342,9 +3325,6 @@ describe("mcp stdio launcher", () => {
 if [ "$(basename "$1")" = "qmd" ]; then
   exec "${process.execPath}" "$@"
 else
-  if [ "\${GGML_BACKEND_SILENT:-}" != "1" ]; then
-    printf 'llama.cpp native log on stdout\\n'
-  fi
   printf '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\\n'
 fi
 `);
@@ -3357,7 +3337,7 @@ fi
           PATH: `${join(tempPackage, "fake-bin")}:${process.env.PATH}`,
           LLAMA_LOG_LEVEL: "",
           GGML_LOG_LEVEL: "",
-          GGML_BACKEND_SILENT: "",
+          GGML_BACKEND_SILENT: "explicit-user-value",
         },
         stdio: ["ignore", "pipe", "pipe"],
       });

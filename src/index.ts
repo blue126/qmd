@@ -46,7 +46,6 @@ import {
   deleteLLMCache,
   deleteInactiveDocuments,
   clearAllEmbeddings,
-  getPendingEmbeddingDocsReadOnly,
   getIndexHealthReadOnly,
   getStatusReadOnly,
   type Store as InternalStore,
@@ -72,10 +71,9 @@ import {
 } from "./store.js";
 import {
   DEFAULT_EMBED_MODEL_URI,
-  LlamaCpp,
   waitForLLMSessionsToDrain,
 } from "./llm.js";
-import { LocalEmbeddingProviderOwner } from "./embedding/local.js";
+import { UnavailableLocalEmbeddingProvider } from "./embedding/local.js";
 import type {
   DocumentMetadata,
   MetadataScalar,
@@ -135,9 +133,7 @@ import {
   writeCanonicalEmbeddingConfig,
 } from "./embedding/config.js";
 import { rebuildCjkLexicalIndex } from "./search/cjk-index.js";
-import { RemoteLLM } from "./remote-llm.js";
-import { Hybrid } from "./hybrid.js";
-import { RemoteJev } from "./remote-jev.js";
+import { createConfiguredLLM } from "./hybrid.js";
 import type { ExpansionMode } from "./search/query-expansion.js";
 import {
   createCollectionConfigSource,
@@ -326,8 +322,8 @@ export interface StoreOptions {
  * The QMD SDK store — provides search, retrieval, collection management,
  * context management, and indexing operations.
  *
- * All methods are async. The store manages its own LlamaCpp instance
- * (lazy-loaded, auto-unloaded after inactivity) — no global singletons.
+ * All methods are async. The store owns its remote model services and closes
+ * them after active work settles.
  */
 export interface QMDStore {
   /** The underlying internal store (for advanced use) */
@@ -491,64 +487,21 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     dbConfig: readCanonicalEmbeddingConfig(db),
     defaultLocalModel: DEFAULT_EMBED_MODEL_URI,
   });
-  if (!options.readOnly || useTemporaryStore) {
+  if ((!options.readOnly || useTemporaryStore) && embedding.canonical.provider !== "local") {
     writeCanonicalEmbeddingConfig(db, embedding.canonical);
   }
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
-  const localLlm = new LlamaCpp({
-    embedModel: embedding.canonical.provider === "local"
-      ? embedding.canonical.model
-      : DEFAULT_EMBED_MODEL_URI,
-    generateModel: config?.models?.generate,
-    rerankModel: config?.models?.rerank,
-    inactivityTimeoutMs: 5 * 60 * 1000,
-    disposeModelsOnInactivity: true,
-  });
-
-  const rawGenerateUrl = config?.models?.generate_url ?? config?.models?.generate_base_url ?? config?.models?.generate_api_url;
-  const rawRerankUrl = config?.models?.rerank_url ?? config?.models?.rerank_base_url ?? config?.models?.rerank_api_url;
-  const hasRemoteLLM = Boolean(rawGenerateUrl || rawRerankUrl);
-
-  const remoteLlm = hasRemoteLLM
-    ? new RemoteLLM({
-        generateUrl: config?.models?.generate_url,
-        generateBaseUrl: config?.models?.generate_base_url,
-        generateApiUrl: config?.models?.generate_api_url,
-        generateApiModel: config?.models?.generate_api_model,
-        generateApiKey: config?.models?.generate_api_key,
-        rerankUrl: config?.models?.rerank_url,
-        rerankBaseUrl: config?.models?.rerank_base_url,
-        rerankApiUrl: config?.models?.rerank_api_url,
-        rerankApiModel: config?.models?.rerank_api_model,
-        rerankApiKey: config?.models?.rerank_api_key,
-        timeoutMs: options.remoteRequestTimeoutMs,
-      })
-    : undefined;
-
-  const jevApiKey = config?.models?.jev_api_key?.trim() || process.env.TYPESAFE_API_KEY?.trim();
-  const jevBaseUrl = config?.models?.jev_base_url?.trim() || process.env.TYPESAFE_BASE_URL?.trim();
-  const jevModel = config?.models?.jev_api_model?.trim() || process.env.TYPESAFE_DEFAULT_MODEL?.trim() || "jev-1.13";
-  const remoteJev = jevApiKey
-    ? new RemoteJev({
-        apiKey: jevApiKey,
-        baseUrl: jevBaseUrl,
-        model: jevModel,
-        timeoutMs: options.remoteRequestTimeoutMs,
-      })
-    : undefined;
-
-  const llm = (remoteLlm || remoteJev) ? new Hybrid(localLlm, remoteLlm, remoteJev) : localLlm;
+  const llm = createConfiguredLLM(config?.models, { timeoutMs: options.remoteRequestTimeoutMs });
   internal.llm = llm;
   let closeEmbeddingResources: () => Promise<void>;
   let remoteKeyConfigured = false;
   if (embedding.canonical.provider === "local") {
-    const embeddingOwner = new LocalEmbeddingProviderOwner(localLlm, {
-      model: embedding.canonical.model,
-      dimension: embedding.canonical.dimension ?? undefined,
-    });
-    internal.embeddingProvider = embeddingOwner.provider;
-    closeEmbeddingResources = () => embeddingOwner.close();
+    const provider = new UnavailableLocalEmbeddingProvider(embedding.canonical);
+    internal.embeddingProvider = provider;
+    closeEmbeddingResources = async () => {
+      await provider.close();
+      await waitForLLMSessionsToDrain(llm);
+      await llm.dispose();
+    };
   } else if (embedding.canonical.provider === "voyageai") {
     const apiKey = resolveVoyageApiKey({
       configApiKey: config?.models?.embed_api_key,
@@ -594,7 +547,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         await provider.close();
       } finally {
         try {
-          await waitForLLMSessionsToDrain(localLlm);
+          await waitForLLMSessionsToDrain(llm);
         } finally {
           await llm.dispose();
         }
@@ -645,7 +598,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         await provider.close();
       } finally {
         try {
-          await waitForLLMSessionsToDrain(localLlm);
+          await waitForLLMSessionsToDrain(llm);
         } finally {
           await llm.dispose();
         }
@@ -850,30 +803,6 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     },
 
     embed: async (embedOpts) => {
-      const provider = internal.embeddingProvider;
-      if (provider?.remote) {
-
-        if (embedOpts?.force && embedOpts.collection) {
-          throw new EmbeddingConfigError(
-            "Remote destructive embedding rebuilds cannot be collection-scoped.",
-          );
-        }
-        const identity = remoteEmbeddingIdentity(provider, embedOpts?.chunkStrategy);
-        const pending = getPendingEmbeddingDocsReadOnly(
-          db,
-          embedOpts?.collection,
-          identity.model,
-          identity.fingerprint,
-        );
-        if (pending.length === 0 && !embedOpts?.force) {
-          return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, failures: [], durationMs: 0 };
-        }
-        if (!remoteKeyConfigured && !embedding.credentialAvailable) {
-          throw new EmbeddingConfigError(
-            "OpenAI document embedding is authorized, but OPENAI_API_KEY is not configured.",
-          );
-        }
-      }
       return generateEmbeddings(internal, {
         force: embedOpts?.force,
         model: embedOpts?.model,
