@@ -199,3 +199,9 @@ or automatic migration/deletion of old vectors. Old local databases remain
 lexically readable; vector conversion requires an explicit manual remote rebuild.
 `qmd pull` is retired and must exit nonzero without downloads. Tests and package
 smoke use mocks or loopback HTTP, with no paid API or local-model setup.
+
+Model-training datasets, fine-tuning/conversion tools, Python ML dependency locks,
+and the retired GPU/Bun container smoke workflow are no longer maintained here.
+Use `pnpm run test:remote` and `pnpm run test:package` for runtime and installation
+checks. Keep legacy local index recognition, rejection regressions, BM25/CJK/AST,
+and retrieval-quality benchmarks; local identity labels do not enable inference.

@@ -4,6 +4,7 @@
 
 ### Changed
 
+- Remove retired fine-tuning datasets, training/conversion tools, and GPU/Bun container smoke assets. Replace the GGUF configuration example with explicit remote APIs and retain legacy-index diagnostics and search-quality benchmarks.
 - **Remote-only runtime (unpublished review build `2026.10.18-remote.0`)**: Remove local GGUF inference and the `node-llama-cpp` dependency. CLI, MCP, and SDK keep local SQLite/BM25, CJK, AST, collections, reads, and maintenance; embedding, query expansion, and reranking use explicitly configured remote APIs. `qmd pull` now reports retirement and exits unsuccessfully without downloading anything. Existing local-model databases remain available for lexical reads; remote vector use requires an explicit manual rebuild rather than automatic vector conversion or deletion. Package and model regression checks use mocks or loopback HTTP only.
 - **Breaking SDK change:** Retire `LlamaCpp`, local provider owners, default-Llama singleton/session helpers, model pull/GGUF/GPU/tokenizer APIs, and `internal.localLlm`. Use `createStore()` with explicit remote models, or `searchLex()` / explicit model-free query options. Missing expansion or reranking configuration fails clearly rather than silently downgrading retrieval.
 

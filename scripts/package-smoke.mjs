@@ -116,7 +116,7 @@ try {
   const packResult = JSON.parse(packOutput);
   const packedFiles = (packResult[0]?.files ?? []).map(file => file.path);
   for (const path of packedFiles) {
-    if (/^(?:src|test|tests|tools|node_modules|\.git|\.tmp)\//.test(path) || /\.(?:gguf|safetensors|onnx)$/.test(path)) {
+    if (/^(?:src|test|tests|tools|finetune|node_modules|\.git|\.tmp)\//.test(path) || /\.(?:gguf|safetensors|onnx)$/.test(path)) {
       throw new PackageSmokeError(`Unexpected source, test, tool, or model in tarball: ${path}`);
     }
     if (path.startsWith("dist/") && path.endsWith(".js") && !existsSync(join(root, "src", path.slice(5, -3) + ".ts"))) {

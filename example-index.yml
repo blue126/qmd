@@ -19,14 +19,20 @@ global_context: "If you see a relevant [[WikiWord]], you can search for that Wik
 # Overridden by the QMD_EDITOR_URI env var.
 # editor_uri: "vscode://file{path}:{line}:{col}"
 
-# ─── Model overrides (optional) ──────────────────────────────────────────────
-# Omit to use the built-in GGUF defaults. `qmd init` writes this block
-# pre-filled with the resolved defaults. See "Model Configuration" in the README
-# for the current default URIs (kept there so this template can't go stale).
+# ─── Remote model APIs (optional for lexical search and document reads) ──────
+# Model-backed operations require explicitly configured remote APIs.
+# Local inference and model downloads are retired; qmd init does not add models.
+# Keep credentials in the environment, for example OPENAI_API_KEY.
+# See "Remote Embedding & Models Configuration" in the README for all providers
+# and the explicit rebuild procedure for existing vectors.
 # models:
-#   embed: "hf:<user>/<repo>/<file>.gguf"
-#   rerank: "hf:<user>/<repo>/<file>.gguf"
-#   generate: "hf:<user>/<repo>/<file>.gguf"
+#   embed_api_url: "https://api.openai.com/v1"
+#   embed_api_model: "text-embedding-3-small"
+#   embed_dimension: 1536
+#   generate_api_url: "https://your-model-gateway.example/v1"
+#   generate_api_model: "your-expansion-model"
+#   rerank_api_url: "https://your-reranker.example/v1"
+#   rerank_api_model: "your-reranker"
 
 # ─── Collections ─────────────────────────────────────────────────────────────
 collections:

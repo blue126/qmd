@@ -85,9 +85,8 @@ releases; skip for small patches.
 ```markdown
 ## [1.1.0] - 2026-03-01
 
-QMD now runs on both Node.js and Bun, with up to 2.7x faster reranking
-through parallel contexts. GPU auto-detection replaces the unreliable
-`gpu: "auto"` with explicit CUDA/Metal/Vulkan probing.
+QMD keeps BM25, Chinese search, and AST chunking local while embedding,
+query expansion, and reranking use explicitly configured remote APIs.
 ```
 
 **2. Detailed changelog (`### Changes` and `### Fixes`)**
@@ -95,15 +94,13 @@ through parallel contexts. GPU auto-detection replaces the unreliable
 ```markdown
 ### Changes
 
-- Runtime: support Node.js (>=22) alongside Bun. The `qmd` wrapper
-  auto-detects a suitable install via PATH. #149 (thanks @igrigorik)
-- Performance: parallel embedding & reranking — up to 2.7x faster on
-  multi-core machines.
+- Runtime: support remote embedding, expansion, and reranking while preserving
+  model-free BM25 and document reads.
+- Quality: retain Chinese search and AST chunking in installed packages.
 
 ### Fixes
 
-- Prevent VRAM waste from duplicate context creation during concurrent
-  `embedBatch` calls. #152 (thanks @jkrems)
+- Reject incompatible embedding identities before altering existing vectors.
 ```
 
 ### Writing guidelines

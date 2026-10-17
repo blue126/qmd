@@ -563,6 +563,13 @@ work without model configuration. Semantic operations require remote model APIs.
 `qmd pull` is retired: it prints migration guidance and exits nonzero without
 network access or downloads.
 
+Model-training datasets, fine-tuning and model-conversion tools, and the retired
+GPU/Bun container smoke workflow have been removed from this repository. Use
+`pnpm run test:remote` for mock and loopback HTTP regressions and
+`pnpm run test:package` for installation checks against the actual tarball,
+including CLI, Jieba, and AST support. Legacy-index diagnostics and search-quality
+benchmarks remain supported.
+
 Existing local-model databases remain readable through BM25 and document tools.
 QMD does not rewrite old vectors or silently send their documents to a provider.
 To use remote vectors, configure the desired remote model and run an explicit
