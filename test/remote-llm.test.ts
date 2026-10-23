@@ -72,11 +72,15 @@ describe("RemoteLLM & Hybrid Integration", () => {
       expect(llm.supportsRerank).toBe(true);
     });
 
-    test("uses the configured timeout for remote requests", async () => {
-      const fetch: typeof globalThis.fetch = async (_input, init) =>
-        new Promise((_resolve, reject) => {
+    test("uses the configured timeout and allows the next expansion request to recover", async () => {
+      let attempts = 0;
+      const fetch: typeof globalThis.fetch = async (_input, init) => {
+        attempts++;
+        if (attempts > 1) return Response.json({ choices: [{ message: { content: "vec: recovered query" } }] });
+        return new Promise((_resolve, reject) => {
           init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
         });
+      };
       const llm = new RemoteLLM({
         generateApiUrl: "https://example.test/v1/chat/completions",
         generateApiModel: "test-model",
@@ -85,7 +89,10 @@ describe("RemoteLLM & Hybrid Integration", () => {
       });
 
       await expect(llm.expandQuery("timeout test")).rejects.toBeInstanceOf(DOMException);
-      expect(llm.supportsExpand).toBe(false);
+      expect(llm.supportsExpand).toBe(true);
+      await expect(llm.expandQuery("query again")).resolves.toContainEqual({ type: "vec", text: "recovered query" });
+      expect(attempts).toBe(2);
+      await llm.dispose();
     });
 
     test("rejects a non-positive remote request timeout", () => {
@@ -497,8 +504,8 @@ describe("RemoteLLM & Hybrid Integration", () => {
       ]);
     });
 
-    test("circuit breaker triggers when remote API fails", async () => {
-      mockResponseStatus = 500;
+    test.each([429, 500, 503])("reranking recovers on the next explicit request after HTTP %s", async (status) => {
+      mockResponseStatus = status;
 
       const llm = new RemoteLLM({
         rerankApiUrl: `http://127.0.0.1:${serverPort}/v1/rerank`,
@@ -507,10 +514,71 @@ describe("RemoteLLM & Hybrid Integration", () => {
 
       expect(llm.supportsRerank).toBe(true);
 
-      await expect(llm.rerank("query", [{ file: "a.md", text: "doc" }])).rejects.toThrow();
+      await expect(llm.rerank("query", [{ file: "a.md", text: "doc" }])).rejects.toThrow(String(status));
+      expect(llm.supportsRerank).toBe(true);
 
-      // Circuit breaker is now active
+      mockResponseStatus = 200;
+      mockResponseBody = { results: [{ index: 0, relevance_score: 0.9 }] };
+      await expect(llm.rerank("query again", [{ file: "a.md", text: "doc" }])).resolves.toMatchObject({
+        results: [{ file: "a.md", score: 0.9 }],
+      });
+      await llm.dispose();
       expect(llm.supportsRerank).toBe(false);
+    });
+
+    test("reranking recovers after a dropped connection without background retries", async () => {
+      let attempts = 0;
+      const llm = new RemoteLLM({
+        rerankApiUrl: "https://example.test/v1/rerank",
+        rerankApiModel: "test-rerank",
+        fetch: async () => {
+          attempts++;
+          if (attempts === 1) throw new TypeError("fetch failed");
+          return Response.json({ results: [{ index: 0, relevance_score: 0.8 }] });
+        },
+      });
+
+      await expect(llm.rerank("query", [{ file: "a.md", text: "doc" }])).rejects.toThrow("fetch failed");
+      expect(attempts).toBe(1);
+      expect(llm.supportsRerank).toBe(true);
+      await expect(llm.rerank("query again", [{ file: "a.md", text: "doc" }])).resolves.toMatchObject({
+        results: [{ file: "a.md", score: 0.8 }],
+      });
+      expect(attempts).toBe(2);
+      await llm.dispose();
+    });
+
+    test("chat-completion reranking recovers after a temporary HTTP error", async () => {
+      const llm = new RemoteLLM({
+        rerankApiUrl: `http://127.0.0.1:${serverPort}/v1/chat/completions`,
+        rerankApiModel: "test-rerank",
+      });
+
+      mockResponseStatus = 503;
+      await expect(llm.rerank("query", [{ file: "a.md", text: "doc" }])).rejects.toThrow("503");
+      expect(llm.supportsRerank).toBe(true);
+      mockResponseStatus = 200;
+      mockResponseBody = { choices: [{ message: { content: '{"results":[{"index":0,"score":0.9}]}' } }] };
+      await expect(llm.rerank("query again", [{ file: "a.md", text: "doc" }])).resolves.toMatchObject({
+        results: [{ file: "a.md", score: 0.9 }],
+      });
+      await llm.dispose();
+    });
+
+    test("query expansion recovers on the same client after a temporary HTTP error", async () => {
+      const llm = new RemoteLLM({
+        generateApiUrl: `http://127.0.0.1:${serverPort}/v1/chat/completions`,
+        generateApiModel: "test-expand",
+      });
+
+      mockResponseStatus = 503;
+      await expect(llm.expandQuery("query")).rejects.toThrow("503");
+      expect(llm.supportsExpand).toBe(true);
+      mockResponseStatus = 200;
+      mockResponseBody = { choices: [{ message: { content: "vec: recovered query" } }] };
+      await expect(llm.expandQuery("query again")).resolves.toContainEqual({ type: "vec", text: "recovered query" });
+      await llm.dispose();
+      expect(llm.supportsExpand).toBe(false);
     });
   });
 
